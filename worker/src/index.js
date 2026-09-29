@@ -70,7 +70,7 @@ export function buildMessages(data, now) {
   const due = t => now.min >= toMin(t) && now.min < toMin(t) + 60;
   const { oneOff, recurring } = pendingHomework(data, now.date);
   const pendingCount = oneOff.length + recurring.length;
-  const label = o => `${o.time ? o.time + ' ' : ''}${o.ev.title}${o.days > 1 ? ` (jour ${o.day}/${o.days})` : ''}`;
+  const label = o => `${o.time ? o.time + (o.ev.endTime && o.ev.endTime > o.time ? '–' + o.ev.endTime : '') + ' ' : ''}${o.ev.title}${o.days > 1 ? ` (jour ${o.day}/${o.days})` : ''}`;
 
   // Récap du matin
   if (due(s.morning)) {

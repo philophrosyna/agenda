@@ -1,4 +1,4 @@
-const CACHE = 'agenda-v4';
+const CACHE = 'agenda-v5';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'shared.js', 'config.js', 'manifest.json', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', e => {

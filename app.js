@@ -52,6 +52,7 @@ const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLow
 const subjects = () => live(db.subjects);
 const subject = id => subjects().find(s => s.id === id) || subjects()[subjects().length - 1] || { id: '?', name: '?', color: '#888' };
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
+const span = (t, ev) => t ? t + (ev.endTime && ev.endTime > t ? '–' + ev.endTime : '') : '';
 const fmtShort = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
 const occ = (from, to) => occurrences(db, from, to);
 const due = h => hwDue(db, h);
@@ -95,7 +96,7 @@ function render() {
 
 function occRow(o) {
   const s = subject(o.ev.subjectId);
-  const meta = [o.time || (o.days > 1 ? '' : 'Toute la journée'), o.ev.place].filter(Boolean).join(' · ');
+  const meta = [span(o.time, o.ev) || (o.days > 1 ? '' : 'Toute la journée'), o.ev.place].filter(Boolean).join(' · ');
   const tag = o.cancelled ? '<span class="badge late">annulé</span>'
     : o.moved ? '<span class="badge soon">déplacé</span>'
     : o.days > 1 ? `<span class="badge">jour ${o.day}/${o.days}</span>` : '';
@@ -127,7 +128,7 @@ function nextClassCard() {
   const hws = pending().oneOff.filter(h => h.subjectId === o.ev.subjectId && due(h) === o.date);
   return `<h2>Prochain cours</h2><div class="card">
     <div class="row" data-occ="${o.ev.id}@${o.orig}"><span class="dot" style="background:${s.color}"></span>
-      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))} à ${esc(o.time)}</small></div><span class="badge soon">${when}</span></div>
+      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))} à ${esc(span(o.time, o.ev))}</small></div><span class="badge soon">${when}</span></div>
     ${hws.map(h => hwRow(h)).join('')}</div>`;
 }
 
@@ -478,6 +479,7 @@ function eventForm(ev, opts = {}) {
     <label>Date</label><input type="date" id="f-date" value="${e.date}">
     <label class="inline"><input type="checkbox" id="f-allday" ${e.time ? '' : 'checked'}> Toute la journée / sans heure</label>
     <div id="w-time"><label>Heure</label><input type="time" id="f-time" value="${e.time || '18:00'}"></div>
+    <div id="w-etime"><label>Heure de fin (facultatif)</label><input type="time" id="f-etime" value="${e.endTime || ''}"></div>
     <label class="inline"><input type="checkbox" id="f-repeat" ${e.repeat === 'weekly' ? 'checked' : ''}> Répéter chaque semaine</label>
     <div id="w-end"><label>Date de fin (événement sur plusieurs jours, facultatif)</label><input type="date" id="f-end" value="${e.endDate || ''}"></div>
     <div id="w-until"><label>Répéter jusqu'au (facultatif)</label><input type="date" id="f-until" value="${e.until || ''}"></div>
@@ -493,7 +495,7 @@ function eventForm(ev, opts = {}) {
     </div>`);
   const sync = () => {
     const allDay = $('#f-allday').checked, rep = $('#f-repeat').checked;
-    $('#w-time').hidden = allDay; $('#w-rem').hidden = allDay;
+    $('#w-time').hidden = allDay; $('#w-etime').hidden = allDay; $('#w-rem').hidden = allDay;
     $('#w-end').hidden = rep; $('#w-until').hidden = !rep;
   };
   ['#f-allday', '#f-repeat'].forEach(s => $(s).addEventListener('change', sync));
@@ -509,8 +511,10 @@ function saveEvent(id) {
   if (!repeat && end && end < date) { alert('La date de fin est avant le début.'); return; }
   if (repeat && until && until < date) { alert('« Jusqu\'au » est avant le début.'); return; }
   const time = allDay ? '' : ($('#f-time').value || '');
+  const endTime = time ? ($('#f-etime').value || '') : '';
+  if (endTime && endTime <= time) { alert("L\u2019heure de fin doit \u00eatre apr\u00e8s le d\u00e9but."); return; }
   const data = {
-    title, date, subjectId: $('#f-subject').value, time,
+    title, date, subjectId: $('#f-subject').value, time, endTime,
     endDate: !repeat && end > date ? end : '', until: repeat ? until : '',
     place: $('#f-place').value.trim(), repeat: repeat ? 'weekly' : 'none', countdown: $('#f-countdown').checked,
     reminders: allDay || !time ? [] : [...document.querySelectorAll('input[name=f-rem]:checked')].map(x => Number(x.value)),
@@ -536,7 +540,7 @@ function occDialog(key) {
   const note = (ev.sessionNotes || {})[orig] || '';
   openDialog(`
     <h3>${esc(ev.title)}</h3>
-    <p class="muted">${esc(fmtDay(cur.date))}${span}${cur.time ? ' à ' + esc(cur.time) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
+    <p class="muted">${esc(fmtDay(cur.date))}${span}${cur.time ? ' à ' + esc(span(cur.time, ev)) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
     <label>Notes de la séance</label><textarea id="o-note" placeholder="Ce que le prof a dit, à revoir, morceau travaillé…">${esc(note)}</textarea>
     <div class="actions"><button class="btn" data-act="save-note" data-key="${key}">Enregistrer la note</button></div>
     <h2>Cette séance uniquement</h2>
