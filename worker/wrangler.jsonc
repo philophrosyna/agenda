@@ -1,0 +1,13 @@
+{
+  "name": "agenda-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "kv_namespaces": [
+    { "binding": "KV", "id": "dd69e8aee3ee4634bfa3f482defd9b6c" }
+  ],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": {
+    "VAPID_PUBLIC_KEY": "BAjIs8A9XSocXQy6A0URT6MP_cCpF6RkFYWSJzF8Om5VyKdAypBlGUn7Rt2kIzn-nEQFH4M6dZGa1s6gmartl-M",
+    "VAPID_SUBJECT": "https://philophrosyna.github.io/agenda/"
+  }
+}
