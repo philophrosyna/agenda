@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mon agenda</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#f6f5f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#151517" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Agenda">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="top"><h1 id="title"></h1></header>
+<main id="view"></main>
+<button id="fab" aria-label="Ajouter">+</button>
+<nav id="tabs">
+  <button data-tab="today">Aujourd'hui</button>
+  <button data-tab="agenda">Agenda</button>
+  <button data-tab="homework">Devoirs</button>
+  <button data-tab="settings">Réglages</button>
+</nav>
+<dialog id="dlg"></dialog>
+<script src="app.js"></script>
+</body>
+</html>

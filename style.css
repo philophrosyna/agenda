@@ -1,0 +1,63 @@
+:root {
+  --bg: #f6f5f2; --card: #ffffff; --text: #1c1c1e; --muted: #6e6e73; --line: #e4e2dc;
+  --accent: #3a6ff7; --danger: #d63b32; --ok: #2f8f6f;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151517; --card: #232326; --text: #f2f2f4; --muted: #9a9aa0; --line: #38383c; --accent: #6d95ff; --danger: #ff6b62; --ok: #4cc79c; }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { padding-top: env(safe-area-inset-top); }
+#top { padding: 14px 16px 4px; }
+h1 { margin: 0; font-size: 28px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 22px 0 8px; }
+main { padding: 0 16px 150px; max-width: 640px; margin: 0 auto; }
+#top { max-width: 640px; margin: 0 auto; }
+
+.card { background: var(--card); border-radius: 14px; overflow: hidden; }
+.row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.row:last-child { border-bottom: 0; }
+.grow { flex: 1; min-width: 0; }
+.grow b { display: block; font-weight: 600; }
+small, .muted { color: var(--muted); font-size: 14px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--line); color: var(--muted); white-space: nowrap; }
+.badge.late { background: var(--danger); color: #fff; }
+.badge.soon { background: #f0a020; color: #fff; }
+.cancelled b, .cancelled small, .done b { text-decoration: line-through; color: var(--muted); }
+.empty { padding: 16px 14px; color: var(--muted); }
+.daytitle { font-weight: 600; margin: 18px 0 6px; text-transform: capitalize; }
+.daytitle.today { color: var(--accent); }
+
+input[type=checkbox].chk { width: 24px; height: 24px; flex: none; accent-color: var(--ok); }
+.practice { padding: 14px; display: flex; align-items: center; gap: 12px; }
+.streak { font-size: 26px; font-weight: 700; }
+
+button { font: inherit; }
+.btn { border: 0; background: var(--accent); color: #fff; padding: 10px 16px; border-radius: 10px; font-weight: 600; cursor: pointer; }
+.btn.sec { background: var(--line); color: var(--text); }
+.btn.danger { background: var(--danger); }
+.btn.small { padding: 6px 12px; font-size: 14px; }
+
+#fab { position: fixed; right: 18px; bottom: calc(72px + env(safe-area-inset-bottom)); width: 56px; height: 56px; border-radius: 50%; border: 0; background: var(--accent); color: #fff; font-size: 32px; line-height: 1; box-shadow: 0 4px 14px rgba(0,0,0,.3); cursor: pointer; z-index: 5; }
+#fab.hidden { display: none; }
+#tabs { position: fixed; left: 0; right: 0; bottom: 0; display: flex; background: var(--card); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); z-index: 4; }
+#tabs button { flex: 1; border: 0; background: none; padding: 14px 4px; color: var(--muted); font-size: 13px; cursor: pointer; }
+#tabs button.active { color: var(--accent); font-weight: 700; }
+
+dialog { border: 0; border-radius: 16px; padding: 18px; width: min(92vw, 460px); max-height: 88vh; background: var(--card); color: var(--text); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog h3 { margin: 0 0 12px; }
+label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+input[type=text], input[type=date], input[type=time], select, textarea {
+  width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font: inherit;
+}
+textarea { min-height: 80px; resize: vertical; }
+.inline { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--text); font-size: 16px; }
+.inline input { width: 20px; height: 20px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.actions .right { margin-left: auto; }
+.setrow { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.setrow:last-child { border-bottom: 0; }
+.setrow input[type=time] { width: auto; }
+.note { padding: 12px 14px; color: var(--muted); font-size: 14px; }
