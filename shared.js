@@ -19,17 +19,39 @@ export const live = arr => (arr || []).filter(x => !x.deleted);
 // Rappels d'un événement (anciens événements : un seul rappel dans reminderMin).
 export const evReminders = ev => ev.reminders ?? (ev.reminderMin != null ? [ev.reminderMin] : []);
 
+export const isRepeat = ev => !!ev.repeat && ev.repeat !== 'none';
+
+// Dates de départ d'une répétition (daily / weekly / biweekly / monthly / yearly) de start à last inclus.
+// Mensuel et annuel gardent le même quantième ; s'il n'existe pas (31, 29 février), on prend le dernier jour du mois.
+function repeatDates(kind, start, last) {
+  const out = [];
+  if (kind === 'monthly' || kind === 'yearly') {
+    const s = parse(start), step = kind === 'yearly' ? 12 : 1;
+    for (let i = 0; ; i++) {
+      const first = new Date(s.getFullYear(), s.getMonth() + i * step, 1);
+      const dim = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+      const d = ymd(new Date(first.getFullYear(), first.getMonth(), Math.min(s.getDate(), dim)));
+      if (d > last) break;
+      out.push(d);
+    }
+  } else {
+    const n = kind === 'daily' ? 1 : kind === 'biweekly' ? 14 : 7;
+    for (let d = start; d <= last; d = addDays(d, n)) out.push(d);
+  }
+  return out;
+}
+
 // Séances entre from et to (inclus), y compris annulées (cancelled:true).
 // Un événement sur plusieurs jours donne une séance par jour (day/days).
 export function occurrences(db, from, to) {
   const out = [];
   for (const ev of live(db.events)) {
-    const weekly = ev.repeat === 'weekly';
+    const weekly = isRepeat(ev);
     const span = weekly ? 0 : Math.max(0, daysBetween(ev.date, ev.endDate || ev.date));
     const bases = [];
     if (weekly) {
       const last = ev.until && ev.until < to ? ev.until : to;
-      for (let d = ev.date; d <= last; d = addDays(d, 7)) bases.push(d);
+      bases.push(...repeatDates(ev.repeat, ev.date, last));
     } else {
       bases.push(ev.date);
     }

@@ -1,5 +1,5 @@
 import {
-  ymd, parse, addDays, daysBetween, weekStart, DEFAULT_SETTINGS, live, occurrences, hwDue, mergeDb,
+  ymd, parse, addDays, daysBetween, weekStart, DEFAULT_SETTINGS, live, occurrences, isRepeat, hwDue, mergeDb,
   evReminders, recurDue, recurDone, pendingHomework, practiced, minutesOn, currentStreak, bestStreak, weekPracticeDays,
 } from './shared.js';
 import { API_URL, VAPID_PUBLIC_KEY } from './config.js';
@@ -13,7 +13,7 @@ const DEFAULTS = () => ({
     { id: 'violon', name: 'Violon', color: '#7b4fd6' },
     { id: 'autre', name: 'Autre', color: '#2f8f6f' },
   ],
-  // {id, title, subjectId, date, endDate?, time ('' = toute la journée), place, repeat:'none'|'weekly', until?, reminders:[min],
+  // {id, title, subjectId, date, endDate?, time ('' = toute la journée), place, repeat:'none'|'daily'|'weekly'|'biweekly'|'monthly'|'yearly', until?, reminders:[min],
   //  exceptions:{[date]:{cancelled}|{moveTo:{date,time}}}, sessionNotes:{[date]:text}, updatedAt, deleted?}
   events: [],
   // {id, title, subjectId, due|null, dueNext, created, done, doneAt, recur?:{days:[0..6]}, doneOn?:{[date]:ts}, updatedAt, deleted?}
@@ -54,7 +54,7 @@ const subject = id => subjects().find(s => s.id === id) || subjects()[subjects()
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 // Heure de fin par défaut : une heure après le début (vide si ça dépasserait minuit).
 const plusHour = t => { const [h, m] = (t || '').split(':').map(Number); return Number.isFinite(h) && h < 23 ? `${String(h + 1).padStart(2, '0')}:${String(m).padStart(2, '0')}` : ''; };
-const span = (t, ev) => t ? t + (ev.endTime && ev.endTime > t ? '–' + ev.endTime : '') : '';
+const timeSpan = (t, ev) => t ? t + (ev.endTime && ev.endTime > t ? '–' + ev.endTime : '') : '';
 const fmtShort = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
 const occ = (from, to) => occurrences(db, from, to);
 const due = h => hwDue(db, h);
@@ -98,7 +98,7 @@ function render() {
 
 function occRow(o) {
   const s = subject(o.ev.subjectId);
-  const meta = [span(o.time, o.ev) || (o.days > 1 ? '' : 'Toute la journée'), o.ev.place].filter(Boolean).join(' · ');
+  const meta = [timeSpan(o.time, o.ev) || (o.days > 1 ? '' : 'Toute la journée'), o.ev.place].filter(Boolean).join(' · ');
   const tag = o.cancelled ? '<span class="badge late">annulé</span>'
     : o.moved ? '<span class="badge soon">déplacé</span>'
     : o.days > 1 ? `<span class="badge">jour ${o.day}/${o.days}</span>` : '';
@@ -130,7 +130,7 @@ function nextClassCard() {
   const hws = pending().oneOff.filter(h => h.subjectId === o.ev.subjectId && due(h) === o.date);
   return `<h2>Prochain cours</h2><div class="card">
     <div class="row" data-occ="${o.ev.id}@${o.orig}"><span class="dot" style="background:${s.color}"></span>
-      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))} à ${esc(span(o.time, o.ev))}</small></div><span class="badge soon">${when}</span></div>
+      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))} à ${esc(timeSpan(o.time, o.ev))}</small></div><span class="badge soon">${when}</span></div>
     ${hws.map(h => hwRow(h)).join('')}</div>`;
 }
 
@@ -467,6 +467,8 @@ const closeDialog = () => dlg.open && dlg.close();
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 
 const subjectOptions = sel => subjects().map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+const REPEATS = [['none', 'Jamais'], ['daily', 'Chaque jour'], ['weekly', 'Chaque semaine'], ['biweekly', 'Toutes les 2 semaines'], ['monthly', 'Chaque mois'], ['yearly', 'Chaque année']];
+const repeatLabel = k => (REPEATS.find(r => r[0] === k) || REPEATS[2])[1].toLowerCase();
 const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille (24 h)']];
 
 /* ----- Événement ----- */
@@ -482,7 +484,8 @@ function eventForm(ev, opts = {}) {
     <label class="inline"><input type="checkbox" id="f-allday" ${e.time ? '' : 'checked'}> Toute la journée / sans heure</label>
     <div id="w-time"><label>Heure</label><input type="time" id="f-time" value="${e.time || '18:00'}"></div>
     <div id="w-etime"><label>Heure de fin (facultatif)</label><input type="time" id="f-etime" value="${e.endTime || ''}"></div>
-    <label class="inline"><input type="checkbox" id="f-repeat" ${e.repeat === 'weekly' ? 'checked' : ''}> Répéter chaque semaine</label>
+    <label>Répétition</label>
+    <select id="f-repeat">${REPEATS.map(([v, l]) => `<option value="${v}" ${(e.repeat || 'none') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
     <div id="w-end"><label>Date de fin (événement sur plusieurs jours, facultatif)</label><input type="date" id="f-end" value="${e.endDate || ''}"></div>
     <div id="w-until"><label>Répéter jusqu'au (facultatif)</label><input type="date" id="f-until" value="${e.until || ''}"></div>
     <label>Lieu</label><input type="text" id="f-place" value="${esc(e.place)}">
@@ -496,7 +499,7 @@ function eventForm(ev, opts = {}) {
       <button class="btn danger right" data-act="delete-event" data-id="${ev.id}">Supprimer la série</button>` : ''}
     </div>`);
   const sync = () => {
-    const allDay = $('#f-allday').checked, rep = $('#f-repeat').checked;
+    const allDay = $('#f-allday').checked, rep = $('#f-repeat').value !== 'none';
     $('#w-time').hidden = allDay; $('#w-etime').hidden = allDay; $('#w-rem').hidden = allDay;
     $('#w-end').hidden = rep; $('#w-until').hidden = !rep;
   };
@@ -509,7 +512,7 @@ function saveEvent(id) {
   const title = $('#f-title').value.trim();
   const date = $('#f-date').value;
   if (!title || !date) { alert('Titre et date obligatoires.'); return; }
-  const allDay = $('#f-allday').checked, repeat = $('#f-repeat').checked;
+  const allDay = $('#f-allday').checked, repeat = $('#f-repeat').value !== 'none';
   const end = $('#f-end').value, until = $('#f-until').value;
   if (!repeat && end && end < date) { alert('La date de fin est avant le début.'); return; }
   if (repeat && until && until < date) { alert('« Jusqu\'au » est avant le début.'); return; }
@@ -519,7 +522,7 @@ function saveEvent(id) {
   const data = {
     title, date, subjectId: $('#f-subject').value, time, endTime,
     endDate: !repeat && end > date ? end : '', until: repeat ? until : '',
-    place: $('#f-place').value.trim(), repeat: repeat ? 'weekly' : 'none', countdown: $('#f-countdown').checked,
+    place: $('#f-place').value.trim(), repeat: $('#f-repeat').value, countdown: $('#f-countdown').checked,
     reminders: allDay || !time ? [] : [...document.querySelectorAll('input[name=f-rem]:checked')].map(x => Number(x.value)),
   };
   if (id) {
@@ -539,11 +542,11 @@ function occDialog(key) {
   const o = occ(orig, addDays(orig, 400)).find(x => x.ev.id === id && x.orig === orig);
   const ex = (ev.exceptions || {})[orig];
   const cur = o || { date: orig, time: ev.time, days: 1 };
-  const span = ev.repeat !== 'weekly' && ev.endDate ? ` → ${fmtShort(ev.endDate)}` : '';
+  const span = !isRepeat(ev) && ev.endDate ? ` → ${fmtShort(ev.endDate)}` : '';
   const note = (ev.sessionNotes || {})[orig] || '';
   openDialog(`
     <h3>${esc(ev.title)}</h3>
-    <p class="muted">${esc(fmtDay(cur.date))}${span}${cur.time ? ' à ' + esc(span(cur.time, ev)) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
+    <p class="muted">${esc(fmtDay(cur.date))}${span}${cur.time ? ' à ' + esc(timeSpan(cur.time, ev)) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
     <label>Notes de la séance</label><textarea id="o-note" placeholder="Ce que le prof a dit, à revoir, morceau travaillé…">${esc(note)}</textarea>
     <div class="actions"><button class="btn" data-act="save-note" data-key="${key}">Enregistrer la note</button></div>
     <h2>Cette séance uniquement</h2>
@@ -662,7 +665,7 @@ function searchResults(q) {
   const evRow = ev => {
     const s = subject(ev.subjectId);
     return `<div class="row" data-occ="${ev.id}@${ev.date}"><span class="dot" style="background:${s.color}"></span>
-      <div class="grow"><b>${esc(ev.title)}</b><small>${ev.repeat === 'weekly' ? 'chaque semaine · depuis le ' : ''}${esc(fmtShort(ev.date))}${ev.time ? ' · ' + esc(ev.time) : ''}</small></div></div>`;
+      <div class="grow"><b>${esc(ev.title)}</b><small>${isRepeat(ev) ? repeatLabel(ev.repeat) + ' · depuis le ' : ''}${esc(fmtShort(ev.date))}${ev.time ? ' · ' + esc(ev.time) : ''}</small></div></div>`;
   };
   const html = [
     evs.length ? `<h2>Événements</h2>${evs.map(evRow).join('')}` : '',
