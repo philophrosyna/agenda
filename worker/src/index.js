@@ -1,9 +1,14 @@
 import { buildPushPayload } from '@block65/webcrypto-web-push';
-import { mergeDb, occurrences, hwDue, live, addDays, parse, DEFAULT_SETTINGS } from '../../shared.js';
+import {
+  mergeDb, restoreSnapshot, occurrences, hwDue, live, addDays, parse, DEFAULT_SETTINGS,
+  evReminders, pendingHomework, practiced, weekStart, daysBetween, weekPracticeDays,
+} from '../../shared.js';
 
 const TZ = 'Europe/Paris';
 const ALLOWED_ORIGINS = ['https://philophrosyna.github.io', 'http://127.0.0.1:8765', 'http://localhost:8765'];
 const MAX_BODY = 512 * 1024;
+const BACKUP_TTL = 60 * 60 * 24 * 45; // 45 jours d'historique
+const BACKUP_HOUR_MIN = 3 * 60;       // sauvegarde automatique vers 3 h (Paris)
 
 /* ---------- Utilitaires ---------- */
 function cors(req) {
@@ -33,7 +38,8 @@ async function authorized(req, env) {
 }
 
 const getJson = async (env, key, fallback) => (await env.KV.get(key, 'json')) ?? fallback;
-const putJson = (env, key, value) => env.KV.put(key, JSON.stringify(value));
+const putJson = (env, key, value, opts) => env.KV.put(key, JSON.stringify(value), opts);
+const EMPTY = () => ({ subjects: [], events: [], homework: [], practice: {}, settings: DEFAULT_SETTINGS });
 
 /* ---------- Heure de Paris ---------- */
 function parisNow() {
@@ -51,6 +57,8 @@ const toMin = hhmm => { const [h, m] = (hhmm || '').split(':').map(Number); retu
 // Minutes absolues d'une date/heure « murales » (sert uniquement à comparer entre elles).
 const absMin = (date, min) => Math.floor(parse(date).getTime() / 60000) + min;
 const dayLabel = date => parse(date).toLocaleDateString('fr-FR', { weekday: 'short' });
+const plural = (n, w) => `${n} ${w}${n > 1 ? 's' : ''}`;
+const REM_LABEL = { 1440: 'demain', 120: 'dans 2 h', 60: 'dans 1 h', 30: 'dans 30 min', 15: 'dans 15 min' };
 
 /* ---------- Composition des notifications ---------- */
 export function buildMessages(data, now) {
@@ -58,17 +66,14 @@ export function buildMessages(data, now) {
   const subj = id => (data.subjects || []).find(x => x.id === id)?.name || '';
   const out = [];
   const due = t => now.min >= toMin(t) && now.min < toMin(t) + 60;
-  const pending = live(data.homework).filter(h => !h.done);
+  const { oneOff, recurring } = pendingHomework(data, now.date);
+  const pendingCount = oneOff.length + recurring.length;
+  const label = o => `${o.time ? o.time + ' ' : ''}${o.ev.title}${o.days > 1 ? ` (jour ${o.day}/${o.days})` : ''}`;
 
   // Récap du matin
   if (due(s.morning)) {
     const today = occurrences(data, now.date, now.date).filter(o => !o.cancelled);
-    if (today.length) {
-      out.push({
-        key: `morning:${now.date}`, title: "Aujourd'hui",
-        body: today.map(o => `${o.time ? o.time + ' ' : ''}${o.ev.title}`).join('\n'),
-      });
-    }
+    if (today.length) out.push({ key: `morning:${now.date}`, title: "Aujourd'hui", body: today.map(label).join('\n') });
   }
 
   // Récap du lundi
@@ -77,43 +82,55 @@ export function buildMessages(data, now) {
     if (week.length) {
       out.push({
         key: `weekly:${now.date}`, title: 'Cette semaine',
-        body: week.map(o => `${dayLabel(o.date)} ${o.time ? o.time + ' ' : ''}${o.ev.title}`).join('\n'),
+        body: week.map(o => `${dayLabel(o.date)} ${label(o)}`).join('\n'),
       });
     }
   }
 
   // Rappel quotidien des devoirs
-  if (pending.length && due(s.homework)) {
+  if (pendingCount && due(s.homework)) {
     const tomorrow = addDays(now.date, 1);
-    const lines = pending
-      .map(h => ({ h, d: hwDue(data, h) }))
-      .sort((a, b) => (a.d || '9').localeCompare(b.d || '9'))
-      .map(({ h, d }) => {
-        const tag = d && d < now.date ? ' (en retard)' : d === now.date ? " (aujourd'hui)" : d === tomorrow ? ' (demain)' : '';
-        return `${subj(h.subjectId)} : ${h.title}${tag}`;
-      });
-    out.push({ key: `homework:${now.date}`, title: `Devoirs à faire (${pending.length})`, body: lines.join('\n') });
+    const lines = [
+      ...oneOff.map(h => ({ h, d: hwDue(data, h) })).sort((a, b) => (a.d || '9').localeCompare(b.d || '9'))
+        .map(({ h, d }) => {
+          const tag = d && d < now.date ? ' (en retard)' : d === now.date ? " (aujourd'hui)" : d === tomorrow ? ' (demain)' : '';
+          return `${subj(h.subjectId)} : ${h.title}${tag}`;
+        }),
+      ...recurring.map(h => `${subj(h.subjectId)} : ${h.title}`),
+    ];
+    out.push({ key: `homework:${now.date}`, title: `Devoirs à faire (${pendingCount})`, body: lines.join('\n') });
   }
 
   // Notif du soir (facultative)
-  if (s.eveningOn && pending.length && due(s.evening)) {
-    out.push({
-      key: `evening:${now.date}`, title: 'Devoirs',
-      body: `Il te reste ${pending.length} devoir${pending.length > 1 ? 's' : ''} à cocher.`,
-    });
+  if (s.eveningOn && pendingCount && due(s.evening)) {
+    out.push({ key: `evening:${now.date}`, title: 'Devoirs', body: `Il te reste ${plural(pendingCount, 'devoir')} à cocher.` });
   }
 
-  // Rappels avant cours
+  // Objectif hebdomadaire de violon : rappel quand il ne reste plus de marge.
+  if (s.practiceGoal > 0 && due(s.goalTime) && !practiced(data, now.date)) {
+    const needed = s.practiceGoal - weekPracticeDays(data, now.date);
+    const daysLeft = 7 - daysBetween(weekStart(now.date), now.date); // aujourd'hui inclus
+    if (needed > 0 && needed >= daysLeft) {
+      out.push({
+        key: `goal:${now.date}`, title: 'Violon',
+        body: `Objectif de la semaine : il te reste ${plural(needed, 'jour')} de pratique pour ${plural(daysLeft, 'jour')} restant${daysLeft > 1 ? 's' : ''}. Pratique aujourd'hui !`,
+      });
+    }
+  }
+
+  // Rappels avant les séances (plusieurs possibles par événement)
   const nowAbs = absMin(now.date, now.min);
   for (const o of occurrences(data, now.date, addDays(now.date, 2))) {
-    const r = o.ev.reminderMin;
-    if (o.cancelled || r == null || !o.time) continue;
+    if (o.cancelled || !o.time || o.day !== 1) continue;
     const at = absMin(o.date, toMin(o.time));
-    if (nowAbs >= at - r && nowAbs < at) {
-      out.push({
-        key: `rem:${o.ev.id}@${o.orig}:${o.date}:${o.time}`, title: o.ev.title,
-        body: `${o.date === now.date ? 'Aujourd\'hui' : dayLabel(o.date)} à ${o.time}${o.ev.place ? ' · ' + o.ev.place : ''}`,
-      });
+    for (const r of evReminders(o.ev)) {
+      // Le rappel part à son heure (tolérance de 20 min si un passage est manqué), jamais après le début.
+      if (nowAbs >= at - r && nowAbs < Math.min(at, at - r + 20)) {
+        out.push({
+          key: `rem:${o.ev.id}@${o.orig}:${o.date}:${o.time}:${r}`, title: o.ev.title,
+          body: `${o.date === now.date ? "Aujourd'hui" : dayLabel(o.date)} à ${o.time}${o.ev.place ? ' · ' + o.ev.place : ''}${REM_LABEL[r] ? ' (' + REM_LABEL[r] + ')' : ''}`,
+        });
+      }
     }
   }
   return out;
@@ -137,12 +154,22 @@ async function pushTo(env, subs, msg) {
   return { ok, dead };
 }
 
+// Sauvegarde quotidienne : une copie datée des données, conservée 45 jours.
+async function dailyBackup(env, data, now) {
+  if (now.min < BACKUP_HOUR_MIN || now.min >= BACKUP_HOUR_MIN + 60) return;
+  const key = `backup:${now.date}`;
+  if (await env.KV.get(key) !== null) return;
+  await putJson(env, key, data, { expirationTtl: BACKUP_TTL });
+}
+
 async function runCron(env) {
-  const subs = await getJson(env, 'subs', []);
-  if (!subs.length) return;
   const data = await getJson(env, 'data', null);
   if (!data) return;
   const now = parisNow();
+  await dailyBackup(env, data, now);
+
+  const subs = await getJson(env, 'subs', []);
+  if (!subs.length) return;
   const sent = await getJson(env, 'sent', {});
   const toSend = buildMessages(data, now).filter(m => !sent[m.key]);
   if (!toSend.length) return;
@@ -173,7 +200,7 @@ async function handle(req, env) {
   try { body = text ? JSON.parse(text) : {}; } catch (e) { return json(req, { error: 'bad json' }, 400); }
 
   if (url.pathname === '/api/sync') {
-    const stored = await getJson(env, 'data', { subjects: [], events: [], homework: [], practice: {}, settings: DEFAULT_SETTINGS });
+    const stored = await getJson(env, 'data', EMPTY());
     const merged = mergeDb(stored, body.data || {});
     if (JSON.stringify(merged) !== JSON.stringify(stored)) await putJson(env, 'data', merged);
     return json(req, { data: merged });
@@ -201,6 +228,33 @@ async function handle(req, env) {
     const subs = await getJson(env, 'subs', []);
     const r = await pushTo(env, subs, { key: 'test', title: 'Agenda', body: 'Les notifications fonctionnent ✓' });
     return json(req, { sent: r.ok, subscriptions: subs.length });
+  }
+
+  // Sauvegardes : liste, création immédiate, restauration.
+  if (url.pathname === '/api/backups') {
+    const list = await env.KV.list({ prefix: 'backup:' });
+    const dates = list.keys.map(k => k.name.slice('backup:'.length)).sort().reverse();
+    return json(req, { dates });
+  }
+
+  if (url.pathname === '/api/backup') {
+    const data = await getJson(env, 'data', null);
+    if (!data) return json(req, { error: 'no data' }, 404);
+    await putJson(env, `backup:${parisNow().date}`, data, { expirationTtl: BACKUP_TTL });
+    return json(req, { ok: true });
+  }
+
+  if (url.pathname === '/api/restore') {
+    const date = String(body.date || '');
+    if (!/^(\d{4}-\d{2}-\d{2}|avant-restauration)$/.test(date)) return json(req, { error: 'bad date' }, 400);
+    const snap = await getJson(env, `backup:${date}`, null);
+    if (!snap) return json(req, { error: 'not found' }, 404);
+    const current = await getJson(env, 'data', EMPTY());
+    // Filet de sécurité : l'état actuel est mis de côté avant d'être remplacé.
+    await putJson(env, `backup:avant-restauration`, current, { expirationTtl: BACKUP_TTL });
+    const restored = restoreSnapshot(current, snap, Date.now());
+    await putJson(env, 'data', restored);
+    return json(req, { data: restored });
   }
 
   return json(req, { error: 'not found' }, 404);

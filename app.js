@@ -1,4 +1,7 @@
-import { ymd, parse, addDays, DEFAULT_SETTINGS, live, occurrences, nextSessionDate, hwDue, mergeDb } from './shared.js';
+import {
+  ymd, parse, addDays, daysBetween, weekStart, DEFAULT_SETTINGS, live, occurrences, hwDue, mergeDb,
+  evReminders, recurDue, recurDone, pendingHomework, practiced, minutesOn, currentStreak, bestStreak, weekPracticeDays,
+} from './shared.js';
 import { API_URL, VAPID_PUBLIC_KEY } from './config.js';
 
 /* ---------- Données ---------- */
@@ -10,8 +13,11 @@ const DEFAULTS = () => ({
     { id: 'violon', name: 'Violon', color: '#7b4fd6' },
     { id: 'autre', name: 'Autre', color: '#2f8f6f' },
   ],
-  events: [],     // {id, title, subjectId, date, time, place, repeat:'none'|'weekly', reminderMin, exceptions:{[date]:{cancelled}|{moveTo:{date,time}}}, sessionNotes:{[date]:text}, updatedAt, deleted?}
-  homework: [],   // {id, title, subjectId, due:'YYYY-MM-DD'|null, dueNext:boolean, created, done, doneAt, updatedAt, deleted?}
+  // {id, title, subjectId, date, endDate?, time ('' = toute la journée), place, repeat:'none'|'weekly', until?, reminders:[min],
+  //  exceptions:{[date]:{cancelled}|{moveTo:{date,time}}}, sessionNotes:{[date]:text}, updatedAt, deleted?}
+  events: [],
+  // {id, title, subjectId, due|null, dueNext, created, done, doneAt, recur?:{days:[0..6]}, doneOn?:{[date]:ts}, updatedAt, deleted?}
+  homework: [],
   practice: {},   // {[date]: {minutes:number|null, updatedAt, deleted?}}
   settings: { ...DEFAULT_SETTINGS },
 });
@@ -23,6 +29,7 @@ function load() {
     const raw = localStorage.getItem(KEY);
     if (raw) {
       const d = Object.assign(DEFAULTS(), JSON.parse(raw));
+      d.settings = { ...DEFAULT_SETTINGS, ...d.settings };
       const now = Date.now();
       [...d.events, ...d.homework, ...Object.values(d.practice)].forEach(r => { if (!r.updatedAt) r.updatedAt = now; });
       return d;
@@ -41,15 +48,23 @@ const $ = s => document.querySelector(s);
 const today = () => ymd(new Date());
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 const subject = id => db.subjects.find(s => s.id === id) || db.subjects[db.subjects.length - 1];
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 const fmtShort = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
 const occ = (from, to) => occurrences(db, from, to);
 const due = h => hwDue(db, h);
-const pendingHw = () => live(db.homework).filter(h => !h.done);
-const practiced = d => !!db.practice[d] && !db.practice[d].deleted;
+const WD = ['D', 'L', 'M', 'M', 'J', 'V', 'S'];      // index = getDay()
+const WD_ORDER = [1, 2, 3, 4, 5, 6, 0];              // affichage lundi d'abord
+
+const pending = () => pendingHomework(db, today());
+const pendingCount = () => { const p = pending(); return p.oneOff.length + p.recurring.length; };
 
 function hwBadge(h) {
+  if (h.recur) {
+    const days = h.recur.days;
+    return `<span class="badge">${days.length === 7 ? 'chaque jour' : WD_ORDER.filter(d => days.includes(d)).map(d => WD[d]).join(' ')}</span>`;
+  }
   if (h.done) return '';
   const d = due(h);
   if (!d) return h.dueNext ? '<span class="badge">prochain cours</span>' : '';
@@ -60,39 +75,40 @@ function hwBadge(h) {
   return `<span class="badge">${esc(fmtShort(d))}</span>`;
 }
 
-function practiceStreak() {
-  let d = today();
-  if (!practiced(d)) d = addDays(d, -1); // la série reste valable tant que la journée n'est pas finie
-  let n = 0;
-  while (practiced(d)) { n++; d = addDays(d, -1); }
-  return n;
-}
-
 /* ---------- Rendu ---------- */
 let tab = 'today';
-const TITLES = { today: "Aujourd'hui", agenda: 'Agenda', homework: 'Devoirs', settings: 'Réglages' };
+let mode = 'list';                     // agenda : 'list' | 'month'
+let month = today().slice(0, 7);       // 'YYYY-MM'
+let selDay = today();
+let noteFilter = 'all';
+const TITLES = { today: "Aujourd'hui", agenda: 'Agenda', homework: 'Devoirs', notes: 'Notes', settings: 'Réglages' };
+const VIEWS = () => ({ today: viewToday, agenda: viewAgenda, homework: viewHomework, notes: viewNotes, settings: viewSettings });
 
 function render() {
   $('#title').textContent = TITLES[tab];
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  $('#fab').classList.toggle('hidden', tab === 'settings');
-  $('#view').innerHTML = { today: viewToday, agenda: viewAgenda, homework: viewHomework, settings: viewSettings }[tab]();
+  $('#fab').classList.toggle('hidden', tab === 'settings' || tab === 'notes');
+  $('#view').innerHTML = VIEWS()[tab]();
   updateBadge();
 }
 
 function occRow(o) {
   const s = subject(o.ev.subjectId);
-  const meta = [o.time, o.ev.place].filter(Boolean).join(' · ');
-  const tag = o.cancelled ? '<span class="badge late">annulé</span>' : (o.moved ? '<span class="badge soon">déplacé</span>' : '');
+  const meta = [o.time || (o.days > 1 ? '' : 'Toute la journée'), o.ev.place].filter(Boolean).join(' · ');
+  const tag = o.cancelled ? '<span class="badge late">annulé</span>'
+    : o.moved ? '<span class="badge soon">déplacé</span>'
+    : o.days > 1 ? `<span class="badge">jour ${o.day}/${o.days}</span>` : '';
   return `<div class="row ${o.cancelled ? 'cancelled' : ''}" data-occ="${o.ev.id}@${o.orig}">
     <span class="dot" style="background:${s.color}"></span>
     <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(meta || s.name)}</small></div>${tag}</div>`;
 }
 
-function hwRow(h) {
+function hwRow(h, forToday) {
   const s = subject(h.subjectId);
-  return `<div class="row ${h.done ? 'done' : ''}" data-hw="${h.id}">
-    <input type="checkbox" class="chk" data-check="${h.id}" ${h.done ? 'checked' : ''}>
+  const checked = h.recur ? recurDone(h, today()) : h.done;
+  const checkable = !h.recur || recurDue(h, today());
+  return `<div class="row ${checked ? 'done' : ''}" data-hw="${h.id}">
+    ${checkable ? `<input type="checkbox" class="chk" ${h.recur ? 'data-checkrec' : 'data-check'}="${h.id}" ${checked ? 'checked' : ''}>` : '<span style="width:24px;flex:none"></span>'}
     <div class="grow"><b>${esc(h.title)}</b><small><span class="dot" style="background:${s.color};display:inline-block"></span> ${esc(s.name)}</small></div>${hwBadge(h)}</div>`;
 }
 
@@ -101,44 +117,108 @@ const byDue = (a, b) => (due(a) || '9').localeCompare(due(b) || '9');
 function viewToday() {
   const t = today();
   const list = occ(t, t);
-  const pending = pendingHw();
+  const { oneOff, recurring } = pending();
+  const all = [...oneOff.sort(byDue), ...recurring];
   const bySubject = {};
-  pending.forEach(h => (bySubject[h.subjectId] = bySubject[h.subjectId] || []).push(h));
-  const p = practiced(t) ? db.practice[t] : null;
-  const streak = practiceStreak();
+  all.forEach(h => (bySubject[h.subjectId] = bySubject[h.subjectId] || []).push(h));
+  const p = practiced(db, t) ? db.practice[t] : null;
+  const streak = currentStreak(db, t);
+  const goal = db.settings.practiceGoal;
+  const goalLine = goal > 0 ? `<small>Cette semaine : ${weekPracticeDays(db, t)}/${goal} jours</small>` : '<small>de pratique d\'affilée</small>';
   return `
     <h2>${esc(fmtDay(t))}</h2>
     <div class="card">${list.length ? list.map(occRow).join('') : '<div class="empty">Rien de prévu aujourd\'hui.</div>'}</div>
     <h2>Devoirs restants</h2>
-    <div class="card">${pending.length
-      ? Object.values(bySubject).map(l => l.sort(byDue).map(hwRow).join('')).join('')
+    <div class="card">${all.length
+      ? Object.values(bySubject).map(l => l.map(h => hwRow(h)).join('')).join('')
       : '<div class="empty">Aucun devoir en attente. 🎉</div>'}</div>
     <h2>Violon</h2>
     <div class="card practice">
-      <div class="grow"><div class="streak">${streak} jour${streak > 1 ? 's' : ''}</div><small>de pratique d'affilée</small></div>
+      <div class="grow"><div class="streak">${streak} jour${streak > 1 ? 's' : ''}</div>${goalLine}${goal > 0 ? '<br><small>de pratique d\'affilée : ' + streak + '</small>' : ''}</div>
+      <button class="btn sec small" data-act="stats">Stats</button>
       ${p ? `<button class="btn sec small" data-act="unpractice">Pratiqué ✓${p.minutes ? ' · ' + p.minutes + ' min' : ''}</button>`
           : '<button class="btn" data-act="practice">J\'ai pratiqué</button>'}
     </div>`;
 }
 
+/* ----- Agenda : liste et mois ----- */
 function viewAgenda() {
+  const seg = `<div class="seg"><button data-mode="list" class="${mode === 'list' ? 'on' : ''}">Liste</button><button data-mode="month" class="${mode === 'month' ? 'on' : ''}">Mois</button></div>`;
+  return seg + (mode === 'month' ? monthView() : listView());
+}
+
+function listView() {
   const t = today();
   const list = occ(t, addDays(t, 60));
-  if (!list.length) return '<div class="card"><div class="empty">Aucun événement dans les 60 prochains jours. Appuie sur + pour en ajouter.</div></div>';
+  if (!list.length) return '<div class="card" style="margin-top:12px"><div class="empty">Aucun événement dans les 60 prochains jours. Appuie sur + pour en ajouter.</div></div>';
   const days = {};
   list.forEach(o => (days[o.date] = days[o.date] || []).push(o));
   return Object.keys(days).sort().map(d =>
     `<div class="daytitle ${d === t ? 'today' : ''}">${esc(fmtDay(d))}</div><div class="card">${days[d].map(occRow).join('')}</div>`).join('');
 }
 
+function monthView() {
+  const first = `${month}-01`;
+  const offset = (parse(first).getDay() + 6) % 7;
+  const start = addDays(first, -offset);
+  const end = addDays(start, 41);
+  const byDay = {};
+  occ(start, end).filter(o => !o.cancelled).forEach(o => (byDay[o.date] = byDay[o.date] || []).push(o));
+  const t = today();
+  let cells = '';
+  for (let i = 0; i < 42; i++) {
+    const d = addDays(start, i);
+    const colors = [...new Set((byDay[d] || []).map(o => subject(o.ev.subjectId).color))].slice(0, 4);
+    cells += `<button class="cell ${d.slice(0, 7) !== month ? 'other' : ''} ${d === t ? 'today' : ''} ${d === selDay ? 'sel' : ''}" data-day="${d}">
+      <span>${parse(d).getDate()}</span><div class="dots">${colors.map(c => `<i style="background:${c}"></i>`).join('')}</div></button>`;
+  }
+  const title = parse(first).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
+  const dayOcc = occ(selDay, selDay);
+  return `
+    <div class="monthbar"><button data-nav="-1">‹</button><b>${esc(title)}</b><button data-nav="1">›</button></div>
+    <div class="grid7">${['L', 'M', 'M', 'J', 'V', 'S', 'D'].map(x => `<div class="wd">${x}</div>`).join('')}${cells}</div>
+    <div class="daytitle ${selDay === t ? 'today' : ''}">${esc(fmtDay(selDay))}</div>
+    <div class="card">${dayOcc.length ? dayOcc.map(occRow).join('') : '<div class="empty">Rien ce jour-là.</div>'}</div>
+    <div class="actions"><button class="btn sec small" data-act="add-on-day">+ Ajouter ce jour</button><button class="btn sec small" data-act="month-today">Aujourd'hui</button></div>`;
+}
+
+/* ----- Devoirs ----- */
 function viewHomework() {
-  const pending = pendingHw().sort(byDue);
-  const done = live(db.homework).filter(h => h.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || '')).slice(0, 15);
+  const t = today();
+  const all = live(db.homework);
+  const oneOff = all.filter(h => !h.recur && !h.done).sort(byDue);
+  const recur = all.filter(h => h.recur);
+  const done = all.filter(h => !h.recur && h.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || '')).slice(0, 15);
   return `
     <h2>À faire</h2>
-    <div class="card">${pending.length ? pending.map(hwRow).join('') : '<div class="empty">Aucun devoir en attente.</div>'}</div>
-    ${done.length ? `<h2>Terminés</h2><div class="card">${done.map(hwRow).join('')}</div>
+    <div class="card">${oneOff.length ? oneOff.map(h => hwRow(h)).join('') : '<div class="empty">Aucun devoir en attente.</div>'}</div>
+    ${recur.length ? `<h2>Récurrents</h2><div class="card">${recur.map(h => hwRow(h)).join('')}</div>` : ''}
+    ${done.length ? `<h2>Terminés</h2><div class="card">${done.map(h => hwRow(h)).join('')}</div>
     <div class="actions"><button class="btn sec small" data-act="clear-done">Vider les terminés</button></div>` : ''}`;
+}
+
+/* ----- Notes de séance (historique par matière) ----- */
+function allNotes() {
+  const out = [];
+  for (const ev of live(db.events)) {
+    for (const [date, text] of Object.entries(ev.sessionNotes || {})) out.push({ ev, date, text });
+  }
+  return out.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function noteRow(n) {
+  const s = subject(n.ev.subjectId);
+  return `<div class="row" data-occ="${n.ev.id}@${n.date}" style="align-items:flex-start">
+    <span class="dot" style="background:${s.color};margin-top:7px"></span>
+    <div class="grow"><b>${esc(n.ev.title)}</b><small>${esc(fmtDay(n.date))}</small><div class="notetext">${esc(n.text)}</div></div></div>`;
+}
+
+function viewNotes() {
+  const chips = [['all', 'Toutes'], ...db.subjects.map(s => [s.id, s.name])]
+    .map(([id, name]) => `<button class="chip ${noteFilter === id ? 'on' : ''}" data-notefilter="${id}">${esc(name)}</button>`).join('');
+  const list = allNotes().filter(n => noteFilter === 'all' || n.ev.subjectId === noteFilter);
+  return `<div class="chips">${chips}</div>
+    <div class="card">${list.length ? list.map(noteRow).join('') : '<div class="empty">Aucune note. Ouvre une séance dans l\'agenda pour en écrire une.</div>'}</div>`;
 }
 
 /* ---------- Synchronisation ---------- */
@@ -174,9 +254,7 @@ async function sync() {
   syncing = true;
   try {
     const { data } = await api('/api/sync', { data: db });
-    const before = JSON.stringify(db);
-    db = mergeDb(db, data);
-    if (JSON.stringify(db) !== before) { saveLocal(); render(); }
+    adopt(mergeDb(db, data));
     const d = new Date();
     syncMsg = `Synchronisé à ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   } catch (e) {
@@ -187,6 +265,12 @@ async function sync() {
     if (tab === 'settings') render();
     if (syncAgain) { syncAgain = false; sync(); }
   }
+}
+
+function adopt(next) {
+  const before = JSON.stringify(db);
+  db = next;
+  if (JSON.stringify(db) !== before) { saveLocal(); render(); }
 }
 
 /* ---------- Notifications (Web Push) ---------- */
@@ -243,7 +327,7 @@ function viewSettings() {
   const s = db.settings;
   const connected = !!getCode();
   const time = (k, label) => `<div class="setrow"><span>${label}</span><input type="time" data-set="${k}" value="${s[k]}"></div>`;
-  const sync = connected
+  const syncCard = connected
     ? `<div class="setrow"><span>Connecté ✓</span><button class="btn sec small" data-act="logout">Déconnecter</button></div>
        <div class="note">${esc(syncMsg || 'Synchronisation en cours…')}</div>`
     : `<div class="note">Entre ton code d'accès pour synchroniser tes appareils et recevoir les notifications.${syncMsg ? '<br><b>' + esc(syncMsg) + '</b>' : ''}</div>
@@ -259,9 +343,10 @@ function viewSettings() {
       notif = '<div class="setrow"><span>Notifications</span><button class="btn small" data-act="push-on">Activer</button></div>';
     }
   }
+  const goalOpts = [0, 1, 2, 3, 4, 5, 6, 7].map(n => `<option value="${n}" ${n === s.practiceGoal ? 'selected' : ''}>${n ? n + ' jour' + (n > 1 ? 's' : '') + ' / semaine' : 'Aucun'}</option>`).join('');
   return `
     <h2>Synchronisation</h2>
-    <div class="card">${sync}</div>
+    <div class="card">${syncCard}</div>
     ${connected ? `<h2>Notifications</h2><div class="card">${notif}</div>` : ''}
     <h2>Horaires des notifications</h2>
     <div class="card">
@@ -272,15 +357,25 @@ function viewSettings() {
       ${time('evening', 'Heure de la notif du soir')}
       <div class="note">Heure de Paris. Le rappel avant un cours se règle sur chaque événement.</div>
     </div>
-    <h2>Sauvegarde</h2>
-    <div class="card"><div class="setrow"><span>Exporter mes données</span><button class="btn sec small" data-act="export">Exporter</button></div>
-    <div class="setrow"><span>Importer une sauvegarde</span><button class="btn sec small" data-act="import">Importer</button></div></div>
+    <h2>Objectif violon</h2>
+    <div class="card">
+      <div class="setrow"><span>Objectif de pratique</span><select data-set="practiceGoal" style="width:auto">${goalOpts}</select></div>
+      ${time('goalTime', 'Rappel si tu es en retard')}
+      <div class="note">Tu reçois une notification quand il ne reste plus de marge pour atteindre l'objectif de la semaine (lundi à dimanche).</div>
+    </div>
+    <h2>Sauvegardes</h2>
+    <div class="card">
+      ${connected ? `<div class="setrow"><span>Sauvegardes du serveur</span><button class="btn sec small" data-act="backups">Voir</button></div>
+      <div class="note">Une copie est faite automatiquement chaque nuit et conservée 45 jours.</div>` : ''}
+      <div class="setrow"><span>Exporter mes données</span><button class="btn sec small" data-act="export">Exporter</button></div>
+      <div class="setrow"><span>Importer une sauvegarde</span><button class="btn sec small" data-act="import">Importer</button></div>
+    </div>
     <input type="file" id="importFile" accept="application/json" hidden>`;
 }
 
 function updateBadge() {
   try {
-    const n = pendingHw().length;
+    const n = pendingCount();
     if ('setAppBadge' in navigator) (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
   } catch (e) { /* non supporté */ }
 }
@@ -292,35 +387,55 @@ const closeDialog = () => dlg.open && dlg.close();
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 
 const subjectOptions = sel => db.subjects.map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
-const REMINDERS = [[null, 'Aucun'], [15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille']];
+const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille (24 h)']];
 
-function eventForm(ev) {
-  const e = ev || { title: '', subjectId: 'chinois', date: today(), time: '18:00', place: '', repeat: 'none', reminderMin: 60 };
+/* ----- Événement ----- */
+function eventForm(ev, opts = {}) {
+  const e = ev || { title: '', subjectId: 'chinois', date: opts.date || today(), endDate: '', time: '18:00', place: '', repeat: 'none', until: '', reminders: [60] };
+  const rems = evReminders(e);
+  const heading = opts.dup ? 'Dupliquer l\'événement' : ev ? 'Modifier la série' : 'Nouvel événement';
   openDialog(`
-    <h3>${ev ? 'Modifier la série' : 'Nouvel événement'}</h3>
+    <h3>${heading}</h3>
     <label>Titre</label><input type="text" id="f-title" value="${esc(e.title)}" placeholder="Cours de chinois">
     <label>Matière</label><select id="f-subject">${subjectOptions(e.subjectId)}</select>
     <label>Date</label><input type="date" id="f-date" value="${e.date}">
-    <label>Heure</label><input type="time" id="f-time" value="${e.time || ''}">
-    <label>Lieu</label><input type="text" id="f-place" value="${esc(e.place)}">
-    <label>Rappel avant</label><select id="f-rem">${REMINDERS.map(([v, l]) => `<option value="${v ?? ''}" ${v === e.reminderMin ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <label class="inline"><input type="checkbox" id="f-allday" ${e.time ? '' : 'checked'}> Toute la journée / sans heure</label>
+    <div id="w-time"><label>Heure</label><input type="time" id="f-time" value="${e.time || '18:00'}"></div>
     <label class="inline"><input type="checkbox" id="f-repeat" ${e.repeat === 'weekly' ? 'checked' : ''}> Répéter chaque semaine</label>
+    <div id="w-end"><label>Date de fin (événement sur plusieurs jours, facultatif)</label><input type="date" id="f-end" value="${e.endDate || ''}"></div>
+    <div id="w-until"><label>Répéter jusqu'au (facultatif)</label><input type="date" id="f-until" value="${e.until || ''}"></div>
+    <label>Lieu</label><input type="text" id="f-place" value="${esc(e.place)}">
+    <div id="w-rem"><label>Rappels avant</label>
+      <div class="checks">${REMINDERS.map(([v, l]) => `<label><input type="checkbox" name="f-rem" value="${v}" ${rems.includes(v) ? 'checked' : ''}> ${l}</label>`).join('')}</div></div>
     <div class="actions">
-      <button class="btn" data-act="save-event" data-id="${ev ? ev.id : ''}">Enregistrer</button>
+      <button class="btn" data-act="save-event" data-id="${ev && !opts.dup ? ev.id : ''}">Enregistrer</button>
       <button class="btn sec" data-act="close">Fermer</button>
-      ${ev ? `<button class="btn danger right" data-act="delete-event" data-id="${ev.id}">Supprimer la série</button>` : ''}
+      ${ev && !opts.dup ? `<button class="btn sec" data-act="dup-event" data-id="${ev.id}">Dupliquer</button>
+      <button class="btn danger right" data-act="delete-event" data-id="${ev.id}">Supprimer la série</button>` : ''}
     </div>`);
+  const sync = () => {
+    const allDay = $('#f-allday').checked, rep = $('#f-repeat').checked;
+    $('#w-time').hidden = allDay; $('#w-rem').hidden = allDay;
+    $('#w-end').hidden = rep; $('#w-until').hidden = !rep;
+  };
+  ['#f-allday', '#f-repeat'].forEach(s => $(s).addEventListener('change', sync));
+  sync();
 }
 
 function saveEvent(id) {
   const title = $('#f-title').value.trim();
   const date = $('#f-date').value;
   if (!title || !date) { alert('Titre et date obligatoires.'); return; }
-  const rem = $('#f-rem').value;
+  const allDay = $('#f-allday').checked, repeat = $('#f-repeat').checked;
+  const end = $('#f-end').value, until = $('#f-until').value;
+  if (!repeat && end && end < date) { alert('La date de fin est avant le début.'); return; }
+  if (repeat && until && until < date) { alert('« Jusqu\'au » est avant le début.'); return; }
+  const time = allDay ? '' : ($('#f-time').value || '');
   const data = {
-    title, date, subjectId: $('#f-subject').value, time: $('#f-time').value || '',
-    place: $('#f-place').value.trim(), repeat: $('#f-repeat').checked ? 'weekly' : 'none',
-    reminderMin: rem === '' ? null : Number(rem),
+    title, date, subjectId: $('#f-subject').value, time,
+    endDate: !repeat && end > date ? end : '', until: repeat ? until : '',
+    place: $('#f-place').value.trim(), repeat: repeat ? 'weekly' : 'none',
+    reminders: allDay || !time ? [] : [...document.querySelectorAll('input[name=f-rem]:checked')].map(x => Number(x.value)),
   };
   if (id) {
     const ev = db.events.find(x => x.id === id);
@@ -338,11 +453,12 @@ function occDialog(key) {
   if (!ev) return;
   const o = occ(orig, addDays(orig, 400)).find(x => x.ev.id === id && x.orig === orig);
   const ex = (ev.exceptions || {})[orig];
-  const cur = o || { date: orig, time: ev.time };
+  const cur = o || { date: orig, time: ev.time, days: 1 };
+  const span = ev.repeat !== 'weekly' && ev.endDate ? ` → ${fmtShort(ev.endDate)}` : '';
   const note = (ev.sessionNotes || {})[orig] || '';
   openDialog(`
     <h3>${esc(ev.title)}</h3>
-    <p class="muted">${esc(fmtDay(cur.date))}${cur.time ? ' à ' + esc(cur.time) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
+    <p class="muted">${esc(fmtDay(cur.date))}${span}${cur.time ? ' à ' + esc(cur.time) : ''}${ev.place ? ' · ' + esc(ev.place) : ''}${ex && ex.cancelled ? ' — <b>annulée</b>' : ''}</p>
     <label>Notes de la séance</label><textarea id="o-note" placeholder="Ce que le prof a dit, à revoir, morceau travaillé…">${esc(note)}</textarea>
     <div class="actions"><button class="btn" data-act="save-note" data-key="${key}">Enregistrer la note</button></div>
     <h2>Cette séance uniquement</h2>
@@ -354,37 +470,140 @@ function occDialog(key) {
     <label>Déplacer à</label>
     <div class="actions" style="margin-top:0"><input type="date" id="o-date" value="${cur.date}" style="flex:1"><input type="time" id="o-time" value="${cur.time || ''}" style="flex:1">
     <button class="btn sec" data-act="move-occ" data-key="${key}">Déplacer</button></div>
-    <div class="actions"><button class="btn sec" data-act="edit-event" data-id="${id}">Modifier la série</button><button class="btn sec right" data-act="close">Fermer</button></div>`);
+    <div class="actions"><button class="btn sec" data-act="edit-event" data-id="${id}">Modifier la série</button><button class="btn sec" data-act="dup-event" data-id="${id}">Dupliquer</button><button class="btn sec right" data-act="close">Fermer</button></div>`);
 }
 
-function hwForm() {
+/* ----- Devoir ----- */
+function hwForm(h, opts = {}) {
+  const e = h || { title: '', subjectId: 'chinois', dueNext: true, due: null };
+  const mode0 = e.recur ? (e.recur.days.length === 7 ? 'daily' : 'days') : e.dueNext ? 'next' : e.due ? 'date' : 'none';
+  const days = e.recur ? e.recur.days : [1, 2, 3, 4, 5];
+  const opt = (v, l) => `<option value="${v}" ${mode0 === v ? 'selected' : ''}>${l}</option>`;
+  const heading = opts.dup ? 'Dupliquer le devoir' : h ? 'Modifier le devoir' : 'Nouveau devoir';
   openDialog(`
-    <h3>Nouveau devoir</h3>
-    <label>Devoir</label><input type="text" id="h-title" placeholder="Exercices page 42">
-    <label>Matière</label><select id="h-subject">${subjectOptions('chinois')}</select>
+    <h3>${heading}</h3>
+    <label>Devoir</label><input type="text" id="h-title" value="${esc(e.title)}" placeholder="Exercices page 42">
+    <label>Matière</label><select id="h-subject">${subjectOptions(e.subjectId)}</select>
     <label>À rendre</label>
-    <select id="h-mode"><option value="next">Pour la prochaine séance</option><option value="date">À une date précise</option><option value="none">Sans date limite</option></select>
-    <div id="h-datewrap" hidden><label>Date limite</label><input type="date" id="h-date" value="${addDays(today(), 1)}"></div>
-    <div class="actions"><button class="btn" data-act="save-hw">Ajouter</button><button class="btn sec" data-act="close">Fermer</button></div>`);
-  $('#h-mode').addEventListener('change', e => { $('#h-datewrap').hidden = e.target.value !== 'date'; });
+    <select id="h-mode">${opt('next', 'Pour la prochaine séance')}${opt('date', 'À une date précise')}${opt('none', 'Sans date limite')}${opt('daily', 'Chaque jour')}${opt('days', 'Certains jours de la semaine')}</select>
+    <div id="h-datewrap" hidden><label>Date limite</label><input type="date" id="h-date" value="${e.due || addDays(today(), 1)}"></div>
+    <div id="h-dayswrap" hidden><label>Jours</label><div class="checks">${WD_ORDER.map(d => `<label><input type="checkbox" name="h-day" value="${d}" ${days.includes(d) ? 'checked' : ''}> ${WD[d]}</label>`).join('')}</div></div>
+    <div class="actions">
+      <button class="btn" data-act="save-hw" data-id="${h && !opts.dup ? h.id : ''}">${h && !opts.dup ? 'Enregistrer' : 'Ajouter'}</button>
+      <button class="btn sec" data-act="close">Fermer</button>
+      ${h && !opts.dup ? `<button class="btn sec" data-act="dup-hw" data-id="${h.id}">Dupliquer</button><button class="btn danger right" data-act="delete-hw" data-id="${h.id}">Supprimer</button>` : ''}
+    </div>`);
+  const sync = () => {
+    const m = $('#h-mode').value;
+    $('#h-datewrap').hidden = m !== 'date'; $('#h-dayswrap').hidden = m !== 'days';
+  };
+  $('#h-mode').addEventListener('change', sync); sync();
 }
 
-function saveHw() {
+function saveHw(id) {
   const title = $('#h-title').value.trim();
   if (!title) { alert('Écris le devoir.'); return; }
-  const mode = $('#h-mode').value;
-  db.homework.push(touch({
-    id: uid(), title, subjectId: $('#h-subject').value, created: today(),
-    due: mode === 'date' ? $('#h-date').value : null, dueNext: mode === 'next', done: false, doneAt: null,
-  }));
+  const m = $('#h-mode').value;
+  const data = { title, subjectId: $('#h-subject').value, due: m === 'date' ? $('#h-date').value : null, dueNext: m === 'next', recur: undefined };
+  if (m === 'daily') data.recur = { days: [0, 1, 2, 3, 4, 5, 6] };
+  if (m === 'days') {
+    const days = [...document.querySelectorAll('input[name=h-day]:checked')].map(x => Number(x.value));
+    if (!days.length) { alert('Choisis au moins un jour.'); return; }
+    data.recur = { days };
+  }
+  if (id) {
+    const h = db.homework.find(x => x.id === id);
+    Object.assign(h, data); touch(h);
+  } else {
+    db.homework.push(touch({ id: uid(), created: today(), done: false, doneAt: null, doneOn: {}, ...data }));
+  }
   save(); closeDialog(); render();
 }
 
+/* ----- Pratique du violon ----- */
 function practiceDialog() {
   openDialog(`
     <h3>Pratique du violon</h3>
     <label>Minutes (facultatif)</label><input type="text" inputmode="numeric" id="p-min" placeholder="30">
     <div class="actions"><button class="btn" data-act="save-practice">Valider</button><button class="btn sec" data-act="close">Fermer</button></div>`);
+}
+
+function statsDialog() {
+  const t = today();
+  const goal = db.settings.practiceGoal;
+  const start = addDays(weekStart(t), -77); // 12 semaines, colonnes = semaines, lignes = lundi..dimanche
+  let heat = '';
+  for (let i = 0; i < 84; i++) {
+    const d = addDays(start, i);
+    const m = minutesOn(db, d);
+    const lvl = !practiced(db, d) ? 0 : !m ? 2 : m < 15 ? 1 : m < 30 ? 2 : 3;
+    heat += `<button class="l${lvl} ${d > t ? 'fut' : ''}" data-pday="${d}" title="${esc(fmtShort(d))}${m ? ' · ' + m + ' min' : ''}" ${d > t ? 'disabled' : ''}></button>`;
+  }
+  let weeks = '';
+  for (let w = 0; w < 4; w++) {
+    const ws = addDays(weekStart(t), -7 * w);
+    let days = 0, mins = 0;
+    for (let i = 0; i < 7; i++) { const d = addDays(ws, i); if (practiced(db, d)) { days++; mins += minutesOn(db, d); } }
+    weeks += `<div class="stat"><span>${w === 0 ? 'Cette semaine' : 'Semaine du ' + esc(fmtShort(ws))}</span><b>${days} j · ${mins} min</b></div>`;
+  }
+  openDialog(`
+    <h3>Statistiques violon</h3>
+    <div class="stat"><span>Série en cours</span><b>${currentStreak(db, t)} j</b></div>
+    <div class="stat"><span>Meilleure série</span><b>${bestStreak(db)} j</b></div>
+    ${goal > 0 ? `<div class="stat"><span>Objectif de la semaine</span><b>${weekPracticeDays(db, t)}/${goal} j</b></div>` : ''}
+    <h2>4 dernières semaines</h2>${weeks}
+    <h2>12 semaines</h2><div class="heat">${heat}</div>
+    <small>Touche un jour pour le cocher ou le décocher (oubli d'un jour passé).</small>
+    <div class="actions"><button class="btn sec" data-act="close">Fermer</button></div>`);
+}
+
+/* ----- Recherche ----- */
+function searchDialog() {
+  openDialog(`
+    <h3>Rechercher</h3>
+    <input type="text" id="q" placeholder="Événement, devoir, note…" autocomplete="off">
+    <div id="qres" class="results"></div>
+    <div class="actions"><button class="btn sec" data-act="close">Fermer</button></div>`);
+  const input = $('#q');
+  input.addEventListener('input', () => { $('#qres').innerHTML = searchResults(norm(input.value.trim())); });
+  input.focus();
+}
+
+function searchResults(q) {
+  if (q.length < 2) return '<div class="note" style="padding:12px 0">Écris au moins 2 lettres.</div>';
+  const evs = live(db.events).filter(ev => norm(ev.title + ' ' + ev.place + ' ' + subject(ev.subjectId).name).includes(q));
+  const notes = allNotes().filter(n => norm(n.text + ' ' + n.ev.title).includes(q));
+  const hws = live(db.homework).filter(h => norm(h.title + ' ' + subject(h.subjectId).name).includes(q));
+  const evRow = ev => {
+    const s = subject(ev.subjectId);
+    return `<div class="row" data-occ="${ev.id}@${ev.date}"><span class="dot" style="background:${s.color}"></span>
+      <div class="grow"><b>${esc(ev.title)}</b><small>${ev.repeat === 'weekly' ? 'chaque semaine · depuis le ' : ''}${esc(fmtShort(ev.date))}${ev.time ? ' · ' + esc(ev.time) : ''}</small></div></div>`;
+  };
+  const html = [
+    evs.length ? `<h2>Événements</h2>${evs.map(evRow).join('')}` : '',
+    notes.length ? `<h2>Notes de séance</h2>${notes.map(noteRow).join('')}` : '',
+    hws.length ? `<h2>Devoirs</h2>${hws.map(h => hwRow(h)).join('')}` : '',
+  ].join('');
+  return html || '<div class="note" style="padding:12px 0">Aucun résultat.</div>';
+}
+
+/* ----- Sauvegardes du serveur ----- */
+async function backupsDialog() {
+  openDialog('<h3>Sauvegardes du serveur</h3><p class="muted">Chargement…</p>');
+  try {
+    const { dates } = await api('/api/backups');
+    const label = d => d === 'avant-restauration' ? 'Avant la dernière restauration' : fmtDay(d);
+    openDialog(`
+      <h3>Sauvegardes du serveur</h3>
+      <div class="actions" style="margin-top:0"><button class="btn small" data-act="backup-now">Sauvegarder maintenant</button></div>
+      <div class="card" style="margin-top:12px">${dates.length
+        ? dates.map(d => `<div class="setrow"><span>${esc(label(d))}</span><button class="btn sec small" data-act="restore-backup" data-date="${d}">Restaurer</button></div>`).join('')
+        : '<div class="empty">Aucune sauvegarde pour l\'instant (la première est faite cette nuit).</div>'}</div>
+      <small>Restaurer remplace tes données actuelles (une copie de l'état actuel est gardée).</small>
+      <div class="actions"><button class="btn sec" data-act="close">Fermer</button></div>`);
+  } catch (e) {
+    openDialog('<h3>Sauvegardes du serveur</h3><p class="muted">Serveur injoignable.</p><div class="actions"><button class="btn sec" data-act="close">Fermer</button></div>');
+  }
 }
 
 /* ---------- Actions ---------- */
@@ -400,6 +619,7 @@ const actions = {
   close: closeDialog,
   'save-event': b => saveEvent(b.dataset.id),
   'edit-event': b => eventForm(db.events.find(x => x.id === b.dataset.id)),
+  'dup-event': b => eventForm(db.events.find(x => x.id === b.dataset.id), { dup: true }),
   'delete-event': b => {
     if (!confirm('Supprimer toute la série ?')) return;
     touch(Object.assign(db.events.find(x => x.id === b.dataset.id), { deleted: true }));
@@ -418,21 +638,30 @@ const actions = {
     ev.sessionNotes = ev.sessionNotes || {};
     const v = $('#o-note').value.trim();
     if (v) ev.sessionNotes[orig] = v; else delete ev.sessionNotes[orig];
-    touch(ev); save(); closeDialog();
+    touch(ev); save(); closeDialog(); render();
   },
-  'save-hw': saveHw,
+  'save-hw': b => saveHw(b.dataset.id),
+  'dup-hw': b => hwForm(db.homework.find(x => x.id === b.dataset.id), { dup: true }),
+  'delete-hw': b => {
+    if (!confirm('Supprimer ce devoir ?')) return;
+    touch(Object.assign(db.homework.find(x => x.id === b.dataset.id), { deleted: true }));
+    save(); closeDialog(); render();
+  },
   'clear-done': () => {
     if (!confirm('Supprimer les devoirs terminés ?')) return;
-    live(db.homework).filter(h => h.done).forEach(h => touch(Object.assign(h, { deleted: true })));
+    live(db.homework).filter(h => !h.recur && h.done).forEach(h => touch(Object.assign(h, { deleted: true })));
     save(); render();
   },
   practice: practiceDialog,
+  stats: statsDialog,
   'save-practice': () => {
     const m = parseInt($('#p-min').value, 10);
     db.practice[today()] = touch({ minutes: Number.isFinite(m) && m > 0 ? m : null });
     save(); closeDialog(); render();
   },
   unpractice: () => { db.practice[today()] = touch({ deleted: true }); save(); render(); },
+  'add-on-day': () => eventForm(null, { date: selDay }),
+  'month-today': () => { month = today().slice(0, 7); selDay = today(); render(); },
   login: () => {
     const v = ($('#codeInput').value || '').trim();
     if (!v) return;
@@ -443,6 +672,21 @@ const actions = {
   'push-on': enablePush,
   'push-off': disablePush,
   'push-test': testPush,
+  backups: backupsDialog,
+  'backup-now': async () => {
+    try { await api('/api/backup'); await backupsDialog(); } catch (e) { alert('Sauvegarde impossible (serveur injoignable).'); }
+  },
+  'restore-backup': async b => {
+    const date = b.dataset.date;
+    if (!confirm('Remplacer toutes tes données actuelles par cette sauvegarde ?')) return;
+    try {
+      await sync(); // pousse d'abord les modifications en attente pour qu'elles soient dans la copie « avant restauration »
+      const { data } = await api('/api/restore', { date });
+      db = data; db.settings = { ...DEFAULT_SETTINGS, ...db.settings }; saveLocal();
+      closeDialog(); render();
+      alert('Sauvegarde restaurée.');
+    } catch (e) { alert('Restauration impossible.'); }
+  },
   export: () => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(db, null, 1)], { type: 'application/json' }));
@@ -452,15 +696,41 @@ const actions = {
   import: () => $('#importFile').click(),
 };
 
+function togglePracticeDay(d) {
+  if (d > today()) return;
+  db.practice[d] = touch(practiced(db, d) ? { deleted: true } : { minutes: null });
+  save(); statsDialog(); render();
+}
+
 document.addEventListener('click', e => {
   const act = e.target.closest('[data-act]');
   if (act && actions[act.dataset.act]) { actions[act.dataset.act](act); return; }
-  if (e.target.closest('[data-check]')) return; // géré par 'change'
+  if (e.target.closest('[data-check],[data-checkrec]')) return; // géré par 'change'
+  const pday = e.target.closest('[data-pday]');
+  if (pday) { togglePracticeDay(pday.dataset.pday); return; }
   const o = e.target.closest('[data-occ]');
   if (o) { occDialog(o.dataset.occ); return; }
+  const hw = e.target.closest('[data-hw]');
+  if (hw) { hwForm(db.homework.find(x => x.id === hw.dataset.hw)); return; }
   const tabBtn = e.target.closest('#tabs button');
   if (tabBtn) { tab = tabBtn.dataset.tab; render(); window.scrollTo(0, 0); return; }
-  if (e.target.closest('#fab')) { tab === 'homework' ? hwForm() : eventForm(null); }
+  const md = e.target.closest('[data-mode]');
+  if (md) { mode = md.dataset.mode; render(); return; }
+  const dayCell = e.target.closest('[data-day]');
+  if (dayCell) { selDay = dayCell.dataset.day; month = selDay.slice(0, 7); render(); return; }
+  const nav = e.target.closest('[data-nav]');
+  if (nav) {
+    const [y, m] = month.split('-').map(Number);
+    const d = new Date(y, m - 1 + Number(nav.dataset.nav), 1);
+    month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    selDay = `${month}-01`; render(); return;
+  }
+  const nf = e.target.closest('[data-notefilter]');
+  if (nf) { noteFilter = nf.dataset.notefilter; render(); return; }
+  if (e.target.closest('#searchBtn')) { searchDialog(); return; }
+  if (e.target.closest('#fab')) {
+    if (tab === 'homework') hwForm(); else eventForm(null, { date: tab === 'agenda' && mode === 'month' ? selDay : undefined });
+  }
 });
 
 document.addEventListener('change', e => {
@@ -470,9 +740,17 @@ document.addEventListener('change', e => {
     h.done = chk.checked; h.doneAt = chk.checked ? new Date().toISOString() : null;
     touch(h); save(); render(); return;
   }
+  const rec = e.target.closest('[data-checkrec]');
+  if (rec) {
+    const h = db.homework.find(x => x.id === rec.dataset.checkrec);
+    h.doneOn = h.doneOn || {};
+    if (rec.checked) h.doneOn[today()] = Date.now(); else delete h.doneOn[today()];
+    touch(h); save(); render(); return;
+  }
   const set = e.target.closest('[data-set]');
   if (set) {
-    db.settings[set.dataset.set] = set.type === 'checkbox' ? set.checked : set.value;
+    const k = set.dataset.set;
+    db.settings[k] = set.type === 'checkbox' ? set.checked : k === 'practiceGoal' ? Number(set.value) : set.value;
     touch(db.settings); save(); return;
   }
   if (e.target.id === 'importFile' && e.target.files[0]) {
@@ -484,7 +762,7 @@ document.addEventListener('change', e => {
         if (!confirm('Remplacer toutes les données actuelles par cette sauvegarde ?')) return;
         // Les données importées reçoivent la date du jour pour l'emporter à la synchro.
         const now = Date.now();
-        [...(data.events || []), ...(data.homework || []), ...Object.values(data.practice || {})].forEach(x => { x.updatedAt = now; });
+        [...data.events, ...data.homework, ...Object.values(data.practice || {})].forEach(x => { x.updatedAt = now; });
         // Ce qui n'est pas dans la sauvegarde est marqué supprimé.
         for (const k of ['events', 'homework']) {
           const keep = new Set(data[k].map(x => x.id));
