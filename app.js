@@ -52,6 +52,8 @@ const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLow
 const subjects = () => live(db.subjects);
 const subject = id => subjects().find(s => s.id === id) || subjects()[subjects().length - 1] || { id: '?', name: '?', color: '#888' };
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
+// Heure de fin par défaut : une heure après le début (vide si ça dépasserait minuit).
+const plusHour = t => { const [h, m] = (t || '').split(':').map(Number); return Number.isFinite(h) && h < 23 ? `${String(h + 1).padStart(2, '0')}:${String(m).padStart(2, '0')}` : ''; };
 const span = (t, ev) => t ? t + (ev.endTime && ev.endTime > t ? '–' + ev.endTime : '') : '';
 const fmtShort = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
 const occ = (from, to) => occurrences(db, from, to);
@@ -469,7 +471,7 @@ const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant']
 
 /* ----- Événement ----- */
 function eventForm(ev, opts = {}) {
-  const e = ev || { title: '', subjectId: 'chinois', date: opts.date || today(), endDate: '', time: '18:00', place: '', repeat: 'none', until: '', reminders: [60] };
+  const e = ev || { title: '', subjectId: 'chinois', date: opts.date || today(), endDate: '', time: '18:00', endTime: '19:00', place: '', repeat: 'none', until: '', reminders: [60] };
   const rems = evReminders(e);
   const heading = opts.dup ? 'Dupliquer l\'événement' : ev ? 'Modifier la série' : 'Nouvel événement';
   openDialog(`
@@ -498,6 +500,7 @@ function eventForm(ev, opts = {}) {
     $('#w-time').hidden = allDay; $('#w-etime').hidden = allDay; $('#w-rem').hidden = allDay;
     $('#w-end').hidden = rep; $('#w-until').hidden = !rep;
   };
+  if (!ev) $('#f-time').addEventListener('input', () => { $('#f-etime').value = plusHour($('#f-time').value); });
   ['#f-allday', '#f-repeat'].forEach(s => $(s).addEventListener('change', sync));
   sync();
 }
