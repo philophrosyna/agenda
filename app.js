@@ -31,7 +31,7 @@ function load() {
       const d = Object.assign(DEFAULTS(), JSON.parse(raw));
       d.settings = { ...DEFAULT_SETTINGS, ...d.settings };
       const now = Date.now();
-      [...d.events, ...d.homework, ...Object.values(d.practice)].forEach(r => { if (!r.updatedAt) r.updatedAt = now; });
+      [...d.subjects, ...d.events, ...d.homework, ...Object.values(d.practice)].forEach(r => { if (!r.updatedAt) r.updatedAt = now; });
       return d;
     }
   } catch (e) { /* stockage indisponible */ }
@@ -41,7 +41,7 @@ function saveLocal() {
   try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* ignore */ }
 }
 const touch = r => { r.updatedAt = Date.now(); return r; };
-function save() { saveLocal(); scheduleSync(); }
+function save() { saveLocal(); dirty = true; scheduleSync(); }
 
 /* ---------- Utilitaires ---------- */
 const $ = s => document.querySelector(s);
@@ -49,7 +49,8 @@ const today = () => ymd(new Date());
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-const subject = id => db.subjects.find(s => s.id === id) || db.subjects[db.subjects.length - 1];
+const subjects = () => live(db.subjects);
+const subject = id => subjects().find(s => s.id === id) || subjects()[subjects().length - 1] || { id: '?', name: '?', color: '#888' };
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 const fmtShort = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
 const occ = (from, to) => occurrences(db, from, to);
@@ -114,6 +115,38 @@ function hwRow(h, forToday) {
 
 const byDue = (a, b) => (due(a) || '9').localeCompare(due(b) || '9');
 
+// Prochain cours (séance avec heure, non annulée) et devoirs à rendre ce jour-là dans la même matière.
+function nextClassCard() {
+  const t = today();
+  const hhmm = new Date().toTimeString().slice(0, 5);
+  const o = occ(t, addDays(t, 30)).find(x => !x.cancelled && x.day === 1 && x.time && (x.date > t || x.time >= hhmm));
+  if (!o) return '';
+  const n = daysBetween(t, o.date);
+  const when = n === 0 ? "aujourd'hui" : n === 1 ? 'demain' : `dans ${n} j`;
+  const s = subject(o.ev.subjectId);
+  const hws = pending().oneOff.filter(h => h.subjectId === o.ev.subjectId && due(h) === o.date);
+  return `<h2>Prochain cours</h2><div class="card">
+    <div class="row" data-occ="${o.ev.id}@${o.orig}"><span class="dot" style="background:${s.color}"></span>
+      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))} à ${esc(o.time)}</small></div><span class="badge soon">${when}</span></div>
+    ${hws.map(h => hwRow(h)).join('')}</div>`;
+}
+
+// Échéances marquées « compte à rebours » (la prochaine occurrence de chaque événement).
+function countdownCard() {
+  const t = today(), seen = new Set(), list = [];
+  for (const o of occ(t, addDays(t, 365))) {
+    if (!o.ev.countdown || o.cancelled || o.day !== 1 || seen.has(o.ev.id)) continue;
+    seen.add(o.ev.id); list.push(o);
+  }
+  if (!list.length) return '';
+  return `<h2>Échéances</h2><div class="card">${list.slice(0, 5).map(o => {
+    const n = daysBetween(t, o.date);
+    return `<div class="row" data-occ="${o.ev.id}@${o.orig}"><span class="dot" style="background:${subject(o.ev.subjectId).color}"></span>
+      <div class="grow"><b>${esc(o.ev.title)}</b><small>${esc(fmtDay(o.date))}${o.time ? ' à ' + esc(o.time) : ''}</small></div>
+      <span class="badge ${n <= 3 ? 'late' : n <= 7 ? 'soon' : ''}" style="font-size:14px">${n === 0 ? "Aujourd'hui" : 'J-' + n}</span></div>`;
+  }).join('')}</div>`;
+}
+
 function viewToday() {
   const t = today();
   const list = occ(t, t);
@@ -128,6 +161,7 @@ function viewToday() {
   return `
     <h2>${esc(fmtDay(t))}</h2>
     <div class="card">${list.length ? list.map(occRow).join('') : '<div class="empty">Rien de prévu aujourd\'hui.</div>'}</div>
+    ${nextClassCard()}${countdownCard()}
     <h2>Devoirs restants</h2>
     <div class="card">${all.length
       ? Object.values(bySubject).map(l => l.map(h => hwRow(h)).join('')).join('')
@@ -214,7 +248,7 @@ function noteRow(n) {
 }
 
 function viewNotes() {
-  const chips = [['all', 'Toutes'], ...db.subjects.map(s => [s.id, s.name])]
+  const chips = [['all', 'Toutes'], ...subjects().map(s => [s.id, s.name])]
     .map(([id, name]) => `<button class="chip ${noteFilter === id ? 'on' : ''}" data-notefilter="${id}">${esc(name)}</button>`).join('');
   const list = allNotes().filter(n => noteFilter === 'all' || n.ev.subjectId === noteFilter);
   return `<div class="chips">${chips}</div>
@@ -227,9 +261,12 @@ const setCode = v => { try { v ? localStorage.setItem(CODE_KEY, v) : localStorag
 
 let syncMsg = '';
 let syncing = false, syncAgain = false, syncTimer = null;
+let serverRev = null;  // dernière version du serveur connue
+let dirty = true;      // modifications locales pas encore envoyées
 let pushState = 'unknown'; // unsupported | off | on | unknown
 
 class AuthError extends Error {}
+class RateError extends Error {}
 
 async function api(path, body) {
   const res = await fetch(API_URL + path, {
@@ -238,6 +275,7 @@ async function api(path, body) {
     body: JSON.stringify(body || {}),
   });
   if (res.status === 401) throw new AuthError();
+  if (res.status === 429) throw new RateError();
   if (!res.ok) throw new Error('http ' + res.status);
   return res.json();
 }
@@ -252,19 +290,32 @@ async function sync() {
   if (!getCode() || !API_URL) return;
   if (syncing) { syncAgain = true; return; }
   syncing = true;
+  const sending = dirty;
+  dirty = false;
   try {
-    const { data } = await api('/api/sync', { data: db });
-    adopt(mergeDb(db, data));
+    const r = await api('/api/sync', { rev: serverRev, data: sending || serverRev === null ? db : undefined });
+    serverRev = r.rev;
+    if (r.data) adopt(mergeDb(db, r.data));
     const d = new Date();
     syncMsg = `Synchronisé à ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   } catch (e) {
+    dirty = dirty || sending;
     if (e instanceof AuthError) { setCode(''); syncMsg = 'Code d\'accès refusé.'; }
+    else if (e instanceof RateError) syncMsg = 'Trop d\'essais : réessaie dans 15 minutes.';
     else syncMsg = 'Hors connexion (les données sont gardées sur cet appareil).';
   } finally {
     syncing = false;
-    if (tab === 'settings') render();
+    renderIfSettings();
     if (syncAgain) { syncAgain = false; sync(); }
   }
+}
+
+// Ne redessine les réglages que si tu n'es pas en train de saisir quelque chose.
+function renderIfSettings() {
+  if (tab !== 'settings') return;
+  const a = document.activeElement;
+  if (a && a.matches && a.matches('input,select,textarea')) return;
+  render();
 }
 
 function adopt(next) {
@@ -285,7 +336,7 @@ async function refreshPushState() {
     pushState = sub && Notification.permission === 'granted' ? 'on' : 'off';
     if (pushState === 'on' && getCode()) api('/api/subscribe', { subscription: sub.toJSON() }).catch(() => {});
   } catch (e) { pushState = 'off'; }
-  if (tab === 'settings') render();
+  renderIfSettings();
 }
 
 async function enablePush() {
@@ -320,6 +371,23 @@ async function testPush() {
     if (!r.subscriptions) alert('Aucun appareil enregistré. Active d\'abord les notifications.');
     else if (!r.sent) alert('Envoi échoué. Réessaie dans un instant.');
   } catch (e) { alert('Serveur injoignable.'); }
+  fetchStatus();
+}
+
+let notifStatus = null;
+async function fetchStatus() {
+  if (!getCode()) return;
+  try { notifStatus = await api('/api/status'); } catch (e) { notifStatus = null; }
+  renderIfSettings();
+}
+
+function statusLine() {
+  if (!notifStatus) return 'Dernier envoi : inconnu';
+  const l = notifStatus.lastSend;
+  if (!l) return "Aucun envoi pour l'instant";
+  const d = new Date(l.at);
+  const day = ymd(d) === today() ? "aujourd'hui" : fmtShort(ymd(d));
+  return `Dernier envoi : ${day} à ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} (${l.title})`;
 }
 
 /* ---------- Réglages ---------- */
@@ -336,6 +404,7 @@ function viewSettings() {
   if (connected) {
     if (pushState === 'on') {
       notif = `<div class="setrow"><span>Notifications activées ✓</span><button class="btn sec small" data-act="push-test">Tester</button></div>
+        <div class="note">${esc(statusLine())}</div>
         <div class="setrow"><span>Désactiver sur cet appareil</span><button class="btn sec small" data-act="push-off">Désactiver</button></div>`;
     } else if (pushState === 'unsupported' || (/iPhone|iPad/.test(navigator.userAgent) && !isStandalone())) {
       notif = '<div class="note">Sur iPhone, ajoute d\'abord l\'appli à l\'écran d\'accueil (Safari > Partager > Sur l\'écran d\'accueil), puis ouvre-la depuis son icône pour activer les notifications.</div>';
@@ -355,7 +424,15 @@ function viewSettings() {
       ${time('homework', 'Rappel des devoirs')}
       <div class="setrow"><span>Notif du soir (devoirs restants)</span><input type="checkbox" class="chk" data-set="eveningOn" ${s.eveningOn ? 'checked' : ''}></div>
       ${time('evening', 'Heure de la notif du soir')}
+      <div class="setrow"><span>Bilan du dimanche soir</span><input type="checkbox" class="chk" data-set="recapOn" ${s.recapOn ? 'checked' : ''}></div>
+      ${time('recapTime', 'Heure du bilan')}
       <div class="note">Heure de Paris. Le rappel avant un cours se règle sur chaque événement.</div>
+    </div>
+    <h2>Matières</h2>
+    <div class="card">
+      ${subjects().map(x => `<div class="setrow"><input type="color" value="${x.color}" data-subcolor="${x.id}" style="width:44px;height:34px;padding:0;border:0;background:none;flex:none">
+        <input type="text" value="${esc(x.name)}" data-subname="${x.id}" style="flex:1;margin:0 8px"><button class="btn sec small" data-act="del-subject" data-id="${x.id}">✕</button></div>`).join('')}
+      <div class="setrow"><input type="text" id="newSubject" placeholder="Nouvelle matière" style="flex:1;margin-right:8px"><button class="btn small" data-act="add-subject">Ajouter</button></div>
     </div>
     <h2>Objectif violon</h2>
     <div class="card">
@@ -386,7 +463,7 @@ function openDialog(html) { dlg.innerHTML = html; if (!dlg.open) dlg.showModal()
 const closeDialog = () => dlg.open && dlg.close();
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 
-const subjectOptions = sel => db.subjects.map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+const subjectOptions = sel => subjects().map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
 const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille (24 h)']];
 
 /* ----- Événement ----- */
@@ -405,6 +482,7 @@ function eventForm(ev, opts = {}) {
     <div id="w-end"><label>Date de fin (événement sur plusieurs jours, facultatif)</label><input type="date" id="f-end" value="${e.endDate || ''}"></div>
     <div id="w-until"><label>Répéter jusqu'au (facultatif)</label><input type="date" id="f-until" value="${e.until || ''}"></div>
     <label>Lieu</label><input type="text" id="f-place" value="${esc(e.place)}">
+    <label class="inline"><input type="checkbox" id="f-countdown" ${e.countdown ? 'checked' : ''}> Compte à rebours (J-…) sur l'accueil</label>
     <div id="w-rem"><label>Rappels avant</label>
       <div class="checks">${REMINDERS.map(([v, l]) => `<label><input type="checkbox" name="f-rem" value="${v}" ${rems.includes(v) ? 'checked' : ''}> ${l}</label>`).join('')}</div></div>
     <div class="actions">
@@ -434,7 +512,7 @@ function saveEvent(id) {
   const data = {
     title, date, subjectId: $('#f-subject').value, time,
     endDate: !repeat && end > date ? end : '', until: repeat ? until : '',
-    place: $('#f-place').value.trim(), repeat: repeat ? 'weekly' : 'none',
+    place: $('#f-place').value.trim(), repeat: repeat ? 'weekly' : 'none', countdown: $('#f-countdown').checked,
     reminders: allDay || !time ? [] : [...document.querySelectorAll('input[name=f-rem]:checked')].map(x => Number(x.value)),
   };
   if (id) {
@@ -620,11 +698,7 @@ const actions = {
   'save-event': b => saveEvent(b.dataset.id),
   'edit-event': b => eventForm(db.events.find(x => x.id === b.dataset.id)),
   'dup-event': b => eventForm(db.events.find(x => x.id === b.dataset.id), { dup: true }),
-  'delete-event': b => {
-    if (!confirm('Supprimer toute la série ?')) return;
-    touch(Object.assign(db.events.find(x => x.id === b.dataset.id), { deleted: true }));
-    save(); closeDialog(); render();
-  },
+  'delete-event': b => { closeDialog(); softDelete([db.events.find(x => x.id === b.dataset.id)], 'Événement supprimé'); },
   'cancel-occ': b => setException(b.dataset.key, { cancelled: true }),
   restore: b => setException(b.dataset.key, null),
   'move-occ': b => {
@@ -642,14 +716,27 @@ const actions = {
   },
   'save-hw': b => saveHw(b.dataset.id),
   'dup-hw': b => hwForm(db.homework.find(x => x.id === b.dataset.id), { dup: true }),
-  'delete-hw': b => {
-    if (!confirm('Supprimer ce devoir ?')) return;
-    touch(Object.assign(db.homework.find(x => x.id === b.dataset.id), { deleted: true }));
-    save(); closeDialog(); render();
-  },
+  'delete-hw': b => { closeDialog(); softDelete([db.homework.find(x => x.id === b.dataset.id)], 'Devoir supprimé'); },
   'clear-done': () => {
-    if (!confirm('Supprimer les devoirs terminés ?')) return;
-    live(db.homework).filter(h => !h.recur && h.done).forEach(h => touch(Object.assign(h, { deleted: true })));
+    const list = live(db.homework).filter(h => !h.recur && h.done);
+    if (list.length) softDelete(list, `${list.length} devoir${list.length > 1 ? 's' : ''} supprimé${list.length > 1 ? 's' : ''}`);
+  },
+  'add-subject': () => {
+    const name = ($('#newSubject').value || '').trim();
+    if (!name) return;
+    const palette = ['#e0483e', '#7b4fd6', '#2f8f6f', '#e0912e', '#2f7fd6', '#c2409a', '#5a6b7b'];
+    db.subjects.push(touch({ id: uid(), name, color: palette[subjects().length % palette.length] }));
+    save(); render();
+  },
+  'del-subject': b => {
+    const list = subjects();
+    if (list.length <= 1) { alert('Il faut garder au moins une matière.'); return; }
+    const s = list.find(x => x.id === b.dataset.id);
+    const target = list.find(x => x.id !== s.id);
+    const used = [...live(db.events), ...live(db.homework)].filter(x => x.subjectId === s.id);
+    if (!confirm(`Supprimer « ${s.name} » ?${used.length ? ` Ses ${used.length} événement(s)/devoir(s) passeront dans « ${target.name} ».` : ''}`)) return;
+    used.forEach(x => { x.subjectId = target.id; touch(x); });
+    touch(Object.assign(s, { deleted: true }));
     save(); render();
   },
   practice: practiceDialog,
@@ -681,8 +768,9 @@ const actions = {
     if (!confirm('Remplacer toutes tes données actuelles par cette sauvegarde ?')) return;
     try {
       await sync(); // pousse d'abord les modifications en attente pour qu'elles soient dans la copie « avant restauration »
-      const { data } = await api('/api/restore', { date });
+      const { rev, data } = await api('/api/restore', { date });
       db = data; db.settings = { ...DEFAULT_SETTINGS, ...db.settings }; saveLocal();
+      serverRev = rev; dirty = false;
       closeDialog(); render();
       alert('Sauvegarde restaurée.');
     } catch (e) { alert('Restauration impossible.'); }
@@ -696,6 +784,23 @@ const actions = {
   import: () => $('#importFile').click(),
 };
 
+let toastTimer = null, toastUndo = null;
+function toast(msg, undo) {
+  const t = $('#toast');
+  t.innerHTML = `<span>${esc(msg)}</span>${undo ? '<button id="toastUndo">Annuler</button>' : ''}`;
+  t.hidden = false;
+  toastUndo = undo;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; toastUndo = null; }, 7000);
+}
+
+// Suppression (propagée aux autres appareils) avec possibilité d'annuler quelques secondes.
+function softDelete(records, msg) {
+  records.forEach(r => touch(Object.assign(r, { deleted: true })));
+  save(); render();
+  toast(msg, () => { records.forEach(r => { delete r.deleted; touch(r); }); save(); render(); });
+}
+
 function togglePracticeDay(d) {
   if (d > today()) return;
   db.practice[d] = touch(practiced(db, d) ? { deleted: true } : { minutes: null });
@@ -703,6 +808,7 @@ function togglePracticeDay(d) {
 }
 
 document.addEventListener('click', e => {
+  if (e.target.closest('#toastUndo')) { const f = toastUndo; $('#toast').hidden = true; toastUndo = null; if (f) f(); return; }
   const act = e.target.closest('[data-act]');
   if (act && actions[act.dataset.act]) { actions[act.dataset.act](act); return; }
   if (e.target.closest('[data-check],[data-checkrec]')) return; // géré par 'change'
@@ -713,7 +819,7 @@ document.addEventListener('click', e => {
   const hw = e.target.closest('[data-hw]');
   if (hw) { hwForm(db.homework.find(x => x.id === hw.dataset.hw)); return; }
   const tabBtn = e.target.closest('#tabs button');
-  if (tabBtn) { tab = tabBtn.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  if (tabBtn) { tab = tabBtn.dataset.tab; render(); window.scrollTo(0, 0); if (tab === 'settings') fetchStatus(); return; }
   const md = e.target.closest('[data-mode]');
   if (md) { mode = md.dataset.mode; render(); return; }
   const dayCell = e.target.closest('[data-day]');
@@ -747,6 +853,15 @@ document.addEventListener('change', e => {
     if (rec.checked) h.doneOn[today()] = Date.now(); else delete h.doneOn[today()];
     touch(h); save(); render(); return;
   }
+  const sn = e.target.closest('[data-subname]');
+  if (sn) {
+    const sb = db.subjects.find(x => x.id === sn.dataset.subname);
+    const v = sn.value.trim();
+    if (v && v !== sb.name) { sb.name = v; touch(sb); save(); }
+    render(); return;
+  }
+  const sc = e.target.closest('[data-subcolor]');
+  if (sc) { const sb = db.subjects.find(x => x.id === sc.dataset.subcolor); sb.color = sc.value; touch(sb); save(); render(); return; }
   const set = e.target.closest('[data-set]');
   if (set) {
     const k = set.dataset.set;

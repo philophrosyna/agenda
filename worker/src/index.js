@@ -9,6 +9,8 @@ const ALLOWED_ORIGINS = ['https://philophrosyna.github.io', 'http://127.0.0.1:87
 const MAX_BODY = 512 * 1024;
 const BACKUP_TTL = 60 * 60 * 24 * 45; // 45 jours d'historique
 const BACKUP_HOUR_MIN = 3 * 60;       // sauvegarde automatique vers 3 h (Paris)
+const MAX_FAILS = 5;
+const FAIL_TTL = 15 * 60;
 
 /* ---------- Utilitaires ---------- */
 function cors(req) {
@@ -118,6 +120,21 @@ export function buildMessages(data, now) {
     }
   }
 
+  // Bilan du dimanche soir (facultatif)
+  if (s.recapOn && now.dow === 0 && due(s.recapTime)) {
+    const ws = weekStart(now.date);
+    const hw = live(data.homework);
+    const done = hw.filter(h => !h.recur && h.done && (h.doneAt || '').slice(0, 10) >= ws).length
+      + hw.filter(h => h.recur).reduce((n, h) => n + Object.keys(h.doneOn || {}).filter(d => d >= ws && d <= now.date).length, 0);
+    const lines = [`Devoirs faits : ${done}`];
+    const days = weekPracticeDays(data, now.date);
+    lines.push(`Violon : ${plural(days, 'jour')} de pratique${s.practiceGoal > 0 ? ` sur ${s.practiceGoal} visés` : ''}`);
+    const next = occurrences(data, addDays(now.date, 1), addDays(now.date, 7)).filter(o => !o.cancelled && o.day === 1);
+    if (next.length) lines.push('Semaine prochaine : ' + next.map(o => `${dayLabel(o.date)} ${o.time ? o.time + ' ' : ''}${o.ev.title}`).join(', '));
+    if (pendingCount) lines.push(`Devoirs restants : ${pendingCount}`);
+    out.push({ key: `recap:${now.date}`, title: 'Bilan de la semaine', body: lines.join('\n') });
+  }
+
   // Rappels avant les séances (plusieurs possibles par événement)
   const nowAbs = absMin(now.date, now.min);
   for (const o of occurrences(data, now.date, addDays(now.date, 2))) {
@@ -175,11 +192,13 @@ async function runCron(env) {
   if (!toSend.length) return;
 
   let dead = [];
+  let last = null;
   for (const m of toSend) {
     const r = await pushTo(env, subs, m);
-    if (r.ok > 0) sent[m.key] = now.date;
+    if (r.ok > 0) { sent[m.key] = now.date; last = { at: new Date().toISOString(), title: m.title }; }
     dead = dead.concat(r.dead);
   }
+  if (last) await putJson(env, 'lastSend', last);
   // Purge des clés d'envoi de plus de 3 jours.
   const limit = addDays(now.date, -3);
   for (const k of Object.keys(sent)) if (sent[k] < limit) delete sent[k];
@@ -192,18 +211,46 @@ async function handle(req, env) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) });
   const url = new URL(req.url);
   if (req.method !== 'POST') return json(req, { error: 'not found' }, 404);
-  if (!(await authorized(req, env))) return json(req, { error: 'unauthorized' }, 401);
+
+  // Protection contre les essais de codes : 5 échecs par adresse IP = blocage 15 minutes.
+  // Le compteur n'est écrit que tant que la limite n'est pas atteinte (ménage le quota d'écritures).
+  const ip = req.headers.get('CF-Connecting-IP') || 'inconnu';
+  const failKey = `fail:${ip}`;
+  const fails = Number(await env.KV.get(failKey)) || 0;
+  if (fails >= MAX_FAILS) return json(req, { error: 'too many attempts' }, 429);
+  if (!(await authorized(req, env))) {
+    await env.KV.put(failKey, String(fails + 1), { expirationTtl: FAIL_TTL });
+    return json(req, { error: 'unauthorized' }, 401);
+  }
 
   const text = await req.text();
   if (text.length > MAX_BODY) return json(req, { error: 'too large' }, 413);
   let body;
   try { body = text ? JSON.parse(text) : {}; } catch (e) { return json(req, { error: 'bad json' }, 400); }
 
+  // Synchro : le client envoie ses données seulement s'il a des modifications (data) et la version
+  // du serveur qu'il connaît (rev). Si rien n'a changé des deux côtés, la réponse est minuscule.
   if (url.pathname === '/api/sync') {
     const stored = await getJson(env, 'data', EMPTY());
-    const merged = mergeDb(stored, body.data || {});
-    if (JSON.stringify(merged) !== JSON.stringify(stored)) await putJson(env, 'data', merged);
-    return json(req, { data: merged });
+    let rev = stored._rev || 0;
+    let merged = stored;
+    if (body.data) {
+      const m = mergeDb(stored, body.data);
+      const { _rev, ...before } = stored;
+      if (JSON.stringify(m) !== JSON.stringify(before)) {
+        rev = Date.now();
+        merged = { ...m, _rev: rev };
+        await putJson(env, 'data', merged);
+      }
+    }
+    if (body.rev != null && body.rev === rev && !(body.data && merged !== stored)) return json(req, { rev, unchanged: true });
+    const { _rev, ...data } = merged;
+    return json(req, { rev, data });
+  }
+
+  if (url.pathname === '/api/status') {
+    const subs = await getJson(env, 'subs', []);
+    return json(req, { lastSend: await getJson(env, 'lastSend', null), subscriptions: subs.length });
   }
 
   if (url.pathname === '/api/subscribe') {
@@ -227,6 +274,7 @@ async function handle(req, env) {
   if (url.pathname === '/api/test') {
     const subs = await getJson(env, 'subs', []);
     const r = await pushTo(env, subs, { key: 'test', title: 'Agenda', body: 'Les notifications fonctionnent ✓' });
+    if (r.ok) await putJson(env, 'lastSend', { at: new Date().toISOString(), title: 'Test' });
     return json(req, { sent: r.ok, subscriptions: subs.length });
   }
 
@@ -253,8 +301,9 @@ async function handle(req, env) {
     // Filet de sécurité : l'état actuel est mis de côté avant d'être remplacé.
     await putJson(env, `backup:avant-restauration`, current, { expirationTtl: BACKUP_TTL });
     const restored = restoreSnapshot(current, snap, Date.now());
-    await putJson(env, 'data', restored);
-    return json(req, { data: restored });
+    const rev = Date.now();
+    await putJson(env, 'data', { ...restored, _rev: rev });
+    return json(req, { rev, data: restored });
   }
 
   return json(req, { error: 'not found' }, 404);

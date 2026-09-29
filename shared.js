@@ -10,7 +10,7 @@ export const weekStart = s => addDays(s, -((parse(s).getDay() + 6) % 7));
 
 export const DEFAULT_SETTINGS = {
   morning: '07:30', weekly: '07:00', homework: '18:00', evening: '20:30', eveningOn: false,
-  practiceGoal: 0, goalTime: '19:00', updatedAt: 0,
+  practiceGoal: 0, goalTime: '19:00', recapOn: false, recapTime: '19:30', updatedAt: 0,
 };
 
 export const live = arr => (arr || []).filter(x => !x.deleted);
@@ -126,7 +126,7 @@ function mergeMap(x = {}, y = {}) {
 
 export function mergeDb(a, b) {
   return {
-    subjects: (a.subjects && a.subjects.length) ? a.subjects : b.subjects,
+    subjects: mergeById(a.subjects, b.subjects),
     events: mergeById(a.events, b.events),
     homework: mergeById(a.homework, b.homework),
     practice: mergeMap(a.practice, b.practice),
@@ -150,7 +150,7 @@ export function restoreSnapshot(current, snap, now) {
     if (!practice[k] && practiced(current, k)) practice[k] = { deleted: true, updatedAt: now };
   }
   return {
-    subjects: snap.subjects && snap.subjects.length ? snap.subjects : current.subjects,
+    subjects: snap.subjects && snap.subjects.length ? arr('subjects') : current.subjects,
     events: arr('events'),
     homework: arr('homework'),
     practice,
