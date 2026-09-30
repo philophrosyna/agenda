@@ -50,7 +50,8 @@ const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(3
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
 const subjects = () => live(db.subjects);
-const subject = id => subjects().find(s => s.id === id) || subjects()[subjects().length - 1] || { id: '?', name: '?', color: '#888' };
+const NO_SUBJECT = { id: '', name: '', color: '#8e8e93' };  // événement sans matière (pas un cours)
+const subject = id => !id ? NO_SUBJECT : subjects().find(s => s.id === id) || subjects()[subjects().length - 1] || { id: '?', name: '?', color: '#888' };
 const fmtDay = s => parse(s).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 // Heure de fin par défaut : une heure après le début (vide si ça dépasserait minuit).
 const plusHour = t => { const [h, m] = (t || '').split(':').map(Number); return Number.isFinite(h) && h < 23 ? `${String(h + 1).padStart(2, '0')}:${String(m).padStart(2, '0')}` : ''; };
@@ -122,7 +123,7 @@ const byDue = (a, b) => (due(a) || '9').localeCompare(due(b) || '9');
 function nextClassCard() {
   const t = today();
   const hhmm = new Date().toTimeString().slice(0, 5);
-  const o = occ(t, addDays(t, 30)).find(x => !x.cancelled && x.day === 1 && x.time && (x.date > t || x.time >= hhmm));
+  const o = occ(t, addDays(t, 30)).find(x => !x.cancelled && x.ev.subjectId && x.day === 1 && x.time && (x.date > t || x.time >= hhmm));
   if (!o) return '';
   const n = daysBetween(t, o.date);
   const when = n === 0 ? "aujourd'hui" : n === 1 ? 'demain' : `dans ${n} j`;
@@ -467,7 +468,7 @@ function openDialog(html) { dlg.innerHTML = html; if (!dlg.open) dlg.showModal()
 const closeDialog = () => dlg.open && dlg.close();
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 
-const subjectOptions = sel => subjects().map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+const subjectOptions = (sel, withNone) => (withNone ? `<option value=\"\" ${!sel ? 'selected' : ''}>Aucune (pas un cours)</option>` : '') + subjects().map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
 const REPEATS = [['none', 'Jamais'], ['daily', 'Chaque jour'], ['weekly', 'Chaque semaine'], ['biweekly', 'Toutes les 2 semaines'], ['monthly', 'Chaque mois'], ['yearly', 'Chaque année']];
 const repeatLabel = k => (REPEATS.find(r => r[0] === k) || REPEATS[2])[1].toLowerCase();
 const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille (24 h)']];
@@ -480,7 +481,7 @@ function eventForm(ev, opts = {}) {
   openDialog(`
     <h3>${heading}</h3>
     <label>Titre</label><input type="text" id="f-title" value="${esc(e.title)}" placeholder="Cours de chinois">
-    <label>Matière</label><select id="f-subject">${subjectOptions(e.subjectId)}</select>
+    <label>Matière</label><select id="f-subject">${subjectOptions(e.subjectId, true)}</select>
     <label>Date</label><input type="date" id="f-date" value="${e.date}">
     <label class="inline"><input type="checkbox" id="f-allday" ${e.time ? '' : 'checked'}> Toute la journée / sans heure</label>
     <div id="w-time"><label>Heure</label><input type="time" id="f-time" value="${e.time || '18:00'}"></div>
