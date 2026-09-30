@@ -123,7 +123,7 @@ const byDue = (a, b) => (due(a) || '9').localeCompare(due(b) || '9');
 function nextClassCard() {
   const t = today();
   const hhmm = new Date().toTimeString().slice(0, 5);
-  const o = occ(t, addDays(t, 30)).find(x => !x.cancelled && x.ev.subjectId && x.day === 1 && x.time && (x.date > t || x.time >= hhmm));
+  const o = occ(t, addDays(t, 30)).find(x => !x.cancelled && isCourse(x.ev.subjectId) && x.day === 1 && x.time && (x.date > t || x.time >= hhmm));
   if (!o) return '';
   const n = daysBetween(t, o.date);
   const when = n === 0 ? "aujourd'hui" : n === 1 ? 'demain' : `dans ${n} j`;
@@ -433,11 +433,12 @@ function viewSettings() {
       ${time('recapTime', 'Heure du bilan')}
       <div class="note">Heure de Paris. Le rappel avant un cours se règle sur chaque événement.</div>
     </div>
-    <h2>Matières</h2>
+    <h2>Matières et catégories</h2>
     <div class="card">
       ${subjects().map(x => `<div class="setrow"><input type="color" value="${x.color}" data-subcolor="${x.id}" style="width:44px;height:34px;padding:0;border:0;background:none;flex:none">
-        <input type="text" value="${esc(x.name)}" data-subname="${x.id}" style="flex:1;margin:0 8px"><button class="btn sec small" data-act="del-subject" data-id="${x.id}">✕</button></div>`).join('')}
-      <div class="setrow"><input type="text" id="newSubject" placeholder="Nouvelle matière" style="flex:1;margin-right:8px"><button class="btn small" data-act="add-subject">Ajouter</button></div>
+        <input type="text" value="${esc(x.name)}" data-subname="${x.id}" style="flex:1;margin:0 8px"><label class="inline" style="margin:0 8px 0 0;font-size:13px"><input type="checkbox" data-subcourse="${x.id}" ${x.course !== false ? 'checked' : ''}> cours</label><button class="btn sec small" data-act="del-subject" data-id="${x.id}">✕</button></div>`).join('')}
+      <div class="setrow"><input type="text" id="newSubject" placeholder="Ex. Sorties, Boulot…" style="flex:1;margin-right:8px"><label class="inline" style="margin:0 8px 0 0;font-size:13px"><input type="checkbox" id="newCourse"> cours</label><button class="btn small" data-act="add-subject">Ajouter</button></div>
+      <div class="note">« Cours » = matière avec devoirs et « Prochain cours ». Décoche pour une simple catégorie de couleur (sorties, boulot…).</div>
     </div>
     <h2>Objectif violon</h2>
     <div class="card">
@@ -468,7 +469,8 @@ function openDialog(html) { dlg.innerHTML = html; if (!dlg.open) dlg.showModal()
 const closeDialog = () => dlg.open && dlg.close();
 dlg.addEventListener('click', e => { if (e.target === dlg) closeDialog(); });
 
-const subjectOptions = (sel, withNone) => (withNone ? `<option value=\"\" ${!sel ? 'selected' : ''}>Aucune (pas un cours)</option>` : '') + subjects().map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+const isCourse = id => !!id && subject(id).course !== false;
+const subjectOptions = (sel, withNone, onlyCourses) => (withNone ? `<option value=\"\" ${!sel ? 'selected' : ''}>Aucune (pas un cours)</option>` : '') + subjects().filter(s => !onlyCourses || s.course !== false || s.id === sel).map(s => `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
 const REPEATS = [['none', 'Jamais'], ['daily', 'Chaque jour'], ['weekly', 'Chaque semaine'], ['biweekly', 'Toutes les 2 semaines'], ['monthly', 'Chaque mois'], ['yearly', 'Chaque année']];
 const repeatLabel = k => (REPEATS.find(r => r[0] === k) || REPEATS[2])[1].toLowerCase();
 const REMINDERS = [[15, '15 min avant'], [30, '30 min avant'], [60, '1 h avant'], [120, '2 h avant'], [1440, 'La veille (24 h)']];
@@ -481,7 +483,7 @@ function eventForm(ev, opts = {}) {
   openDialog(`
     <h3>${heading}</h3>
     <label>Titre</label><input type="text" id="f-title" value="${esc(e.title)}" placeholder="Cours de chinois">
-    <label>Matière</label><select id="f-subject">${subjectOptions(e.subjectId, true)}</select>
+    <label>Matière / catégorie</label><select id="f-subject">${subjectOptions(e.subjectId, true)}</select>
     <label>Date</label><input type="date" id="f-date" value="${e.date}">
     <label class="inline"><input type="checkbox" id="f-allday" ${e.time ? '' : 'checked'}> Toute la journée / sans heure</label>
     <div id="w-time"><label>Heure</label><input type="time" id="f-time" value="${e.time || '18:00'}"></div>
@@ -573,7 +575,7 @@ function hwForm(h, opts = {}) {
   openDialog(`
     <h3>${heading}</h3>
     <label>Devoir</label><input type="text" id="h-title" value="${esc(e.title)}" placeholder="Exercices page 42">
-    <label>Matière</label><select id="h-subject">${subjectOptions(e.subjectId)}</select>
+    <label>Matière</label><select id="h-subject">${subjectOptions(e.subjectId, false, true)}</select>
     <label>À rendre</label>
     <select id="h-mode">${opt('next', 'Pour la prochaine séance')}${opt('date', 'À une date précise')}${opt('none', 'Sans date limite')}${opt('daily', 'Chaque jour')}${opt('days', 'Certains jours de la semaine')}</select>
     <div id="h-datewrap" hidden><label>Date limite</label><input type="date" id="h-date" value="${e.due || addDays(today(), 1)}"></div>
@@ -737,7 +739,7 @@ const actions = {
     const name = ($('#newSubject').value || '').trim();
     if (!name) return;
     const palette = ['#e0483e', '#7b4fd6', '#2f8f6f', '#e0912e', '#2f7fd6', '#c2409a', '#5a6b7b'];
-    db.subjects.push(touch({ id: uid(), name, color: palette[subjects().length % palette.length] }));
+    db.subjects.push(touch({ id: uid(), name, color: palette[subjects().length % palette.length], course: $('#newCourse').checked }));
     save(); render();
   },
   'del-subject': b => {
@@ -876,6 +878,8 @@ document.addEventListener('change', e => {
     if (v && v !== sb.name) { sb.name = v; touch(sb); save(); }
     render(); return;
   }
+  const scr = e.target.closest('[data-subcourse]');
+  if (scr) { const sb = db.subjects.find(x => x.id === scr.dataset.subcourse); sb.course = scr.checked; touch(sb); save(); render(); return; }
   const sc = e.target.closest('[data-subcolor]');
   if (sc) { const sb = db.subjects.find(x => x.id === sc.dataset.subcolor); sb.color = sc.value; touch(sb); save(); render(); return; }
   const set = e.target.closest('[data-set]');
