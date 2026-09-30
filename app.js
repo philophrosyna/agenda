@@ -2,7 +2,7 @@ import {
   ymd, parse, addDays, daysBetween, weekStart, DEFAULT_SETTINGS, live, occurrences, isRepeat, hwDue, mergeDb,
   evReminders, recurDue, recurDone, pendingHomework, practiced, minutesOn, currentStreak, bestStreak, weekPracticeDays,
 } from './shared.js';
-import { API_URL, VAPID_PUBLIC_KEY } from './config.js';
+import { API_URL, VAPID_PUBLIC_KEY, APP_VERSION } from './config.js';
 
 /* ---------- Données ---------- */
 const KEY = 'appcal.v1';
@@ -86,6 +86,8 @@ let mode = 'list';                     // agenda : 'list' | 'month'
 let month = today().slice(0, 7);       // 'YYYY-MM'
 let selDay = today();
 let noteFilter = 'all';
+let weekRef = today();                 // un jour de la semaine affichée (vue semaine)
+let updMsg = '';
 const TITLES = { today: "Aujourd'hui", agenda: 'Agenda', homework: 'Devoirs', notes: 'Notes', settings: 'Réglages' };
 const VIEWS = () => ({ today: viewToday, agenda: viewAgenda, homework: viewHomework, notes: viewNotes, settings: viewSettings });
 
@@ -95,6 +97,7 @@ function render() {
   $('#fab').classList.toggle('hidden', tab === 'settings' || tab === 'notes');
   $('#view').innerHTML = VIEWS()[tab]();
   updateBadge();
+  updateBanner();
 }
 
 function occRow(o) {
@@ -182,8 +185,9 @@ function viewToday() {
 
 /* ----- Agenda : liste et mois ----- */
 function viewAgenda() {
-  const seg = `<div class="seg"><button data-mode="list" class="${mode === 'list' ? 'on' : ''}">Liste</button><button data-mode="month" class="${mode === 'month' ? 'on' : ''}">Mois</button></div>`;
-  return seg + (mode === 'month' ? monthView() : listView());
+  const seg = `<div class="seg"><button data-mode="list" class="${mode === 'list' ? 'on' : ''}">Liste</button><button data-mode="week" class="${mode === 'week' ? 'on' : ''}">Semaine</button><button data-mode="month" class="${mode === 'month' ? 'on' : ''}">Mois</button></div>`;
+  const period = '<div class="actions" style="margin-top:8px"><button class="btn sec small" data-act="cancel-period">Annuler une période…</button></div>';
+  return seg + (mode === 'month' ? monthView() : mode === 'week' ? weekView() : listView()) + period;
 }
 
 function listView() {
@@ -194,6 +198,46 @@ function listView() {
   list.forEach(o => (days[o.date] = days[o.date] || []).push(o));
   return Object.keys(days).sort().map(d =>
     `<div class="daytitle ${d === t ? 'today' : ''}">${esc(fmtDay(d))}</div><div class="card">${days[d].map(occRow).join('')}</div>`).join('');
+}
+
+/* ----- Agenda : semaine avec les heures ----- */
+function weekView() {
+  const ws = weekStart(weekRef), we = addDays(ws, 6), t = today();
+  const all = occ(ws, we);
+  const timed = all.filter(o => o.time), allDay = all.filter(o => !o.time);
+  const toMin = x => { const [h, m] = x.split(':').map(Number); return h * 60 + m; };
+  const endOf = o => { const st = toMin(o.time); const en = o.ev.endTime && toMin(o.ev.endTime) > st ? toMin(o.ev.endTime) : st + 60; return Math.min(en, 1440); };
+  let h0 = 8, h1 = 20;
+  timed.forEach(o => { h0 = Math.min(h0, Math.floor(toMin(o.time) / 60)); h1 = Math.max(h1, Math.ceil(endOf(o) / 60)); });
+  const PX = 40, H = (h1 - h0) * PX;
+  const days = [...Array(7)].map((_, i) => addDays(ws, i));
+  const head = days.map((d, i) => `<div class="wk-h ${d === t ? 'today' : ''}">${['L', 'M', 'M', 'J', 'V', 'S', 'D'][i]}<b>${parse(d).getDate()}</b></div>`).join('');
+  const chip = o => `<div class="wk-chip ${o.cancelled ? 'cancelled' : ''}" style="background:${subject(o.ev.subjectId).color}" data-occ="${o.ev.id}@${o.orig}">${esc(o.ev.title)}</div>`;
+  const adRow = allDay.length ? `<div class="wk-grid wk-allday"><span></span>${days.map(d => `<div>${allDay.filter(o => o.date === d).map(chip).join('')}</div>`).join('')}</div>` : '';
+  const hours = [...Array(h1 - h0)].map((_, i) => `<span style="top:${i * PX}px">${h0 + i}h</span>`).join('');
+  const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+  const cols = days.map(d => {
+    const evs = timed.filter(o => o.date === d).map(o => ({ o, s: toMin(o.time), e: endOf(o) })).sort((a, b) => a.s - b.s || b.e - a.e);
+    const done = []; let cluster = [], clusterEnd = 0;
+    const flush = () => { const lanes = Math.max(1, ...cluster.map(x => x.lane + 1)); cluster.forEach(x => { x.lanes = lanes; done.push(x); }); cluster = []; };
+    for (const x of evs) {
+      if (cluster.length && x.s >= clusterEnd) { flush(); clusterEnd = 0; }
+      const used = new Set(cluster.filter(c => c.e > x.s).map(c => c.lane));
+      let lane = 0; while (used.has(lane)) lane++;
+      x.lane = lane; cluster.push(x); clusterEnd = Math.max(clusterEnd, x.e);
+    }
+    flush();
+    const blocks = done.map(x => `<div class="wk-ev ${x.o.cancelled ? 'cancelled' : ''}" data-occ="${x.o.ev.id}@${x.o.orig}"
+      style="top:${(x.s - h0 * 60) * PX / 60}px;height:${Math.max(16, (x.e - x.s) * PX / 60 - 1)}px;left:${x.lane * 100 / x.lanes}%;width:calc(${100 / x.lanes}% - 1px);background:${subject(x.o.ev.subjectId).color}">${esc(x.o.ev.title)}</div>`).join('');
+    const line = d === t && nowMin >= h0 * 60 && nowMin <= h1 * 60 ? `<i class="wk-now" style="top:${(nowMin - h0 * 60) * PX / 60}px"></i>` : '';
+    return `<div class="wk-col" style="height:${H}px">${blocks}${line}</div>`;
+  }).join('');
+  return `
+    <div class="monthbar"><button data-wnav="-1">‹</button><b>${esc(parse(ws).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }))} – ${esc(parse(we).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }))}</b><button data-wnav="1">›</button></div>
+    <div class="wk-grid wk-head"><span></span>${head}</div>
+    ${adRow}
+    <div class="wk-grid wk-body"><div class="wk-hours" style="height:${H}px">${hours}</div>${cols}</div>
+    <div class="actions"><button class="btn sec small" data-act="week-today">Cette semaine</button></div>`;
 }
 
 function monthView() {
@@ -270,6 +314,33 @@ let serverRev = null;  // dernière version du serveur connue
 let dirty = true;      // modifications locales pas encore envoyées
 let pushState = 'unknown'; // unsupported | off | on | unknown
 
+// Alerte quand la synchro échoue depuis un moment (les données restent alors seulement sur cet appareil).
+const LASTOK_KEY = 'appcal.lastok';
+let lastOk = 0;
+try { lastOk = Number(localStorage.getItem(LASTOK_KEY)) || 0; } catch (e) { /* ignore */ }
+let syncFails = 0, failSince = 0;
+function markSync(ok) {
+  if (ok) {
+    syncFails = 0; failSince = 0; lastOk = Date.now();
+    try { localStorage.setItem(LASTOK_KEY, String(lastOk)); } catch (e) { /* ignore */ }
+  } else {
+    syncFails++;
+    if (!failSince) failSince = Date.now();
+  }
+  updateBanner();
+}
+const ago = ms => { const m = Math.max(1, Math.round(ms / 60000)); return m < 60 ? `${m} min` : m < 2880 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} j`; };
+function updateBanner() {
+  const b = $('#banner');
+  if (!b) return;
+  const since = lastOk || failSince;
+  const show = !!getCode() && syncFails > 0 && since && Date.now() - since >= 10 * 60000;
+  b.hidden = !show;
+  if (show) {
+    b.innerHTML = `<span>⚠ Pas de synchronisation depuis ${ago(Date.now() - since)}.${dirty ? ' Tes dernières modifications ne sont que sur cet appareil.' : ''}</span><button data-act="retry-sync">Réessayer</button>`;
+  }
+}
+
 class AuthError extends Error {}
 class RateError extends Error {}
 
@@ -300,11 +371,13 @@ async function sync() {
   try {
     const r = await api('/api/sync', { rev: serverRev, data: sending || serverRev === null ? db : undefined });
     serverRev = r.rev;
+    markSync(true);
     if (r.data) adopt(mergeDb(db, r.data));
     const d = new Date();
     syncMsg = `Synchronisé à ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   } catch (e) {
     dirty = dirty || sending;
+    if (!(e instanceof AuthError)) markSync(false);
     if (e instanceof AuthError) { setCode(''); syncMsg = 'Code d\'accès refusé.'; }
     else if (e instanceof RateError) syncMsg = 'Trop d\'essais : réessaie dans 15 minutes.';
     else syncMsg = 'Hors connexion (les données sont gardées sur cet appareil).';
@@ -445,6 +518,11 @@ function viewSettings() {
       <div class="setrow"><span>Objectif de pratique</span><select data-set="practiceGoal" style="width:auto">${goalOpts}</select></div>
       ${time('goalTime', 'Rappel si tu es en retard')}
       <div class="note">Tu reçois une notification quand il ne reste plus de marge pour atteindre l'objectif de la semaine (lundi à dimanche).</div>
+    </div>
+    <h2>Application</h2>
+    <div class="card">
+      <div class="setrow"><span>Version ${APP_VERSION}</span><button class="btn sec small" data-act="check-update">Chercher une mise à jour</button></div>
+      ${updMsg ? `<div class="note">${updMsg}</div>` : ''}
     </div>
     <h2>Sauvegardes</h2>
     <div class="card">
@@ -753,6 +831,43 @@ const actions = {
     touch(Object.assign(s, { deleted: true }));
     save(); render();
   },
+  'week-today': () => { weekRef = today(); render(); },
+  'retry-sync': () => sync(),
+  'cancel-period': () => periodDialog(),
+  'cancel-period-go': () => {
+    const from = $('#pd-from').value, to = $('#pd-to').value, sid = $('#pd-subject').value;
+    if (!from || !to || to < from) { alert('Dates invalides.'); return; }
+    const list = occ(from, to).filter(o => !o.cancelled && o.day === 1 && isCourse(o.ev.subjectId) && (!sid || o.ev.subjectId === sid));
+    if (!list.length) { alert('Aucune séance à annuler sur cette période.'); return; }
+    const undo = [];
+    list.forEach(o => {
+      const ev = o.ev;
+      ev.exceptions = ev.exceptions || {};
+      undo.push([ev, o.orig, ev.exceptions[o.orig]]);
+      ev.exceptions[o.orig] = { cancelled: true };
+      touch(ev);
+    });
+    save(); closeDialog(); render();
+    const n = list.length;
+    toast(`${n} séance${n > 1 ? 's' : ''} annulée${n > 1 ? 's' : ''}`, () => {
+      undo.forEach(([ev, orig, prev]) => { if (prev === undefined) delete ev.exceptions[orig]; else ev.exceptions[orig] = prev; touch(ev); });
+      save(); render();
+    });
+  },
+  'check-update': async () => {
+    updMsg = 'Vérification…'; render();
+    try {
+      const txt = await (await fetch('config.js', { cache: 'no-store' })).text();
+      const m = txt.match(/APP_VERSION\s*=\s*(\d+)/);
+      const latest = m ? Number(m[1]) : 0;
+      updMsg = latest > APP_VERSION ? `Version ${latest} disponible. <button class="btn small" data-act="reload-app">Mettre à jour</button>` : 'Tu as la dernière version.';
+    } catch (e) { updMsg = 'Impossible de vérifier (hors connexion ?).'; }
+    render();
+  },
+  'reload-app': async () => {
+    try { const r = await navigator.serviceWorker.getRegistration(); if (r) await r.update(); } catch (e) { /* ignore */ }
+    location.reload();
+  },
   practice: () => practiceDialog(),
   'practice-yday': () => {
     const y = addDays(today(), -1);
@@ -819,6 +934,18 @@ function softDelete(records, msg) {
   toast(msg, () => { records.forEach(r => { delete r.deleted; touch(r); }); save(); render(); });
 }
 
+function periodDialog() {
+  const t = today();
+  const opts = '<option value="">Tous les cours</option>' + subjects().filter(x => x.course !== false).map(x => `<option value="${x.id}">${esc(x.name)}</option>`).join('');
+  openDialog(`
+    <h3>Annuler une période</h3>
+    <p class="muted">Les séances des cours choisis entre ces deux dates sont annulées (tu pourras les rétablir une par une).</p>
+    <label>Du</label><input type="date" id="pd-from" value="${t}">
+    <label>Au (inclus)</label><input type="date" id="pd-to" value="${addDays(t, 14)}">
+    <label>Cours concernés</label><select id="pd-subject">${opts}</select>
+    <div class="actions"><button class="btn danger" data-act="cancel-period-go">Annuler ces séances</button><button class="btn sec" data-act="close">Fermer</button></div>`);
+}
+
 function togglePracticeDay(d) {
   if (d > today()) return;
   db.practice[d] = touch(practiced(db, d) ? { deleted: true } : { minutes: null });
@@ -842,6 +969,8 @@ document.addEventListener('click', e => {
   if (md) { mode = md.dataset.mode; render(); return; }
   const dayCell = e.target.closest('[data-day]');
   if (dayCell) { selDay = dayCell.dataset.day; month = selDay.slice(0, 7); render(); return; }
+  const wn = e.target.closest('[data-wnav]');
+  if (wn) { weekRef = addDays(weekRef, 7 * Number(wn.dataset.wnav)); render(); return; }
   const nav = e.target.closest('[data-nav]');
   if (nav) {
     const [y, m] = month.split('-').map(Number);
@@ -917,6 +1046,7 @@ sync();
 refreshPushState();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); sync(); } });
 setInterval(() => { if (!document.hidden) sync(); }, 60000);
+setInterval(updateBanner, 30000);
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
