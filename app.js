@@ -180,7 +180,7 @@ function viewToday() {
       ${p ? `<button class="btn sec small" data-act="unpractice">Pratiqué ✓${p.minutes ? ' · ' + p.minutes + ' min' : ''}</button>`
           : '<button class="btn" data-act="practice">J\'ai pratiqué</button>'}
     </div>
-    <div class="actions"><button class="btn sec small" data-act="practice-yday">${practiced(db, addDays(t, -1)) ? 'Hier pratiqué ✓ (retirer)' : "Ajouter l'entraînement d'hier"}</button></div>`;
+    <div class="actions"><button class="btn sec small" data-act="practice-yday">${practiced(db, addDays(t, -1)) ? 'Hier pratiqué ✓ (retirer)' : "Ajouter l'entraînement d'hier"}</button> <button class="btn sec small" data-act="practice-other">Un autre jour…</button></div>`;
 }
 
 /* ----- Agenda : liste et mois ----- */
@@ -691,11 +691,16 @@ function saveHw(id) {
 }
 
 /* ----- Pratique du violon ----- */
-function practiceDialog(d = today()) {
+// Saisie d'une séance de violon : aujourd'hui, un jour précis (d) ou au choix (pick = sélecteur de date).
+function practiceDialog(d = today(), pick = false) {
+  const cur = practiced(db, d) ? db.practice[d] : null;
   openDialog(`
-    <h3>${d === today() ? 'Pratique du violon' : 'Pratique du violon : ' + esc(fmtShort(d))}</h3>
-    <label>Minutes (facultatif)</label><input type="text" inputmode="numeric" id="p-min" placeholder="30">
-    <div class="actions"><button class="btn" data-act="save-practice" data-date="${d}">Valider</button><button class="btn sec" data-act="close">Fermer</button></div>`);
+    <h3>${pick ? 'Entraînement un autre jour' : d === today() ? 'Pratique du violon' : 'Pratique du violon : ' + esc(fmtShort(d))}</h3>
+    ${pick ? `<label>Jour</label><input type="date" id="p-date" value="${d}" max="${today()}">` : ''}
+    <label>Minutes (facultatif)</label><input type="text" inputmode="numeric" id="p-min" placeholder="30" value="${cur && cur.minutes ? cur.minutes : ''}">
+    <div class="actions"><button class="btn" data-act="save-practice" data-date="${d}">Valider</button>
+      ${cur && !pick ? `<button class="btn sec" data-act="unpractice-day" data-date="${d}">Retirer ce jour</button>` : ''}
+      <button class="btn sec" data-act="close">Fermer</button></div>`);
 }
 
 function statsDialog() {
@@ -723,7 +728,7 @@ function statsDialog() {
     ${goal > 0 ? `<div class="stat"><span>Objectif de la semaine</span><b>${weekPracticeDays(db, t)}/${goal} j</b></div>` : ''}
     <h2>4 dernières semaines</h2>${weeks}
     <h2>12 semaines</h2><div class="heat">${heat}</div>
-    <small>Touche un jour pour le cocher ou le décocher (oubli d'un jour passé).</small>
+    <small>Touche un jour pour l'ajouter, modifier ses minutes ou le retirer.</small>
     <div class="actions"><button class="btn sec" data-act="close">Fermer</button></div>`);
 }
 
@@ -874,9 +879,14 @@ const actions = {
     if (practiced(db, y)) { db.practice[y] = touch({ deleted: true }); save(); render(); } else practiceDialog(y);
   },
   stats: statsDialog,
+  'practice-other': () => practiceDialog(addDays(today(), -1), true),
+  'unpractice-day': b => { db.practice[b.dataset.date] = touch({ deleted: true }); save(); closeDialog(); render(); },
   'save-practice': b => {
     const m = parseInt($('#p-min').value, 10);
-    db.practice[b.dataset.date || today()] = touch({ minutes: Number.isFinite(m) && m > 0 ? m : null });
+    const pd = $('#p-date');
+    const day = pd ? pd.value : (b.dataset.date || today());
+    if (!day || day > today()) { alert('Choisis un jour passé ou aujourd\'hui.'); return; }
+    db.practice[day] = touch({ minutes: Number.isFinite(m) && m > 0 ? m : null });
     save(); closeDialog(); render();
   },
   unpractice: () => { db.practice[today()] = touch({ deleted: true }); save(); render(); },
@@ -948,8 +958,7 @@ function periodDialog() {
 
 function togglePracticeDay(d) {
   if (d > today()) return;
-  db.practice[d] = touch(practiced(db, d) ? { deleted: true } : { minutes: null });
-  save(); statsDialog(); render();
+  practiceDialog(d);
 }
 
 document.addEventListener('click', e => {
