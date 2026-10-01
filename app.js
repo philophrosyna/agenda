@@ -98,6 +98,7 @@ function render() {
   $('#view').innerHTML = VIEWS()[tab]();
   updateBadge();
   updateBanner();
+  updateTimerBar();
 }
 
 function occRow(o) {
@@ -180,7 +181,7 @@ function viewToday() {
       ${p ? `<button class="btn sec small" data-act="unpractice">Pratiqué ✓${p.minutes ? ' · ' + p.minutes + ' min' : ''}</button>`
           : '<button class="btn" data-act="practice">J\'ai pratiqué</button>'}
     </div>
-    <div class="actions"><button class="btn sec small" data-act="practice-yday">${practiced(db, addDays(t, -1)) ? 'Hier pratiqué ✓ (retirer)' : "Ajouter l'entraînement d'hier"}</button> <button class="btn sec small" data-act="practice-other">Un autre jour…</button></div>`;
+    <div class="actions"><button class="btn sec small" data-act="practice-yday">${practiced(db, addDays(t, -1)) ? 'Hier pratiqué ✓ (retirer)' : "Ajouter l'entraînement d'hier"}</button> <button class="btn sec small" data-act="practice-other">Un autre jour…</button>${timer ? '' : ' <button class="btn sec small" data-act="timer-start">⏱ Minuteur</button>'}</div>`;
 }
 
 /* ----- Agenda : liste et mois ----- */
@@ -340,6 +341,41 @@ function updateBanner() {
     b.innerHTML = `<span>⚠ Pas de synchronisation depuis ${ago(Date.now() - since)}.${dirty ? ' Tes dernières modifications ne sont que sur cet appareil.' : ''}</span><button data-act="retry-sync">Réessayer</button>`;
   }
 }
+
+// Minuteur de violon : on garde l'heure de départ (et non un compteur), donc il reste juste
+// même si l'écran se verrouille ou si l'appli est suspendue.
+const TIMER_KEY = 'appcal.timer';
+let timer = null;   // { acc: ms déjà écoulées, startedAt: ms | null si en pause }
+try { timer = JSON.parse(localStorage.getItem(TIMER_KEY)); } catch (e) { /* ignore */ }
+const timerMs = () => timer ? timer.acc + (timer.startedAt ? Date.now() - timer.startedAt : 0) : 0;
+const p2 = n => String(n).padStart(2, '0');
+function clock(ms) {
+  const sec = Math.floor(ms / 1000), h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  return (h ? `${h}:${p2(m)}` : `${m}`) + ':' + p2(sec % 60);
+}
+let wake = null;
+async function keepAwake(on) {
+  try {
+    if (on && !wake && 'wakeLock' in navigator && !document.hidden) {
+      wake = await navigator.wakeLock.request('screen');
+      wake.addEventListener('release', () => { wake = null; });
+    } else if (!on && wake) { await wake.release(); wake = null; }
+  } catch (e) { /* non supporté : l'écran pourra se mettre en veille, le minuteur reste juste */ }
+}
+function saveTimer() {
+  try { timer ? localStorage.setItem(TIMER_KEY, JSON.stringify(timer)) : localStorage.removeItem(TIMER_KEY); } catch (e) { /* ignore */ }
+  updateTimerBar();
+}
+function updateTimerBar() {
+  const bar = $('#timerbar');
+  if (!bar) return;
+  bar.hidden = !timer;
+  keepAwake(!!timer && !!timer.startedAt);
+  if (!timer) { bar.innerHTML = ''; return; }
+  bar.innerHTML = `<span>⏱ Violon <b id="tclock">${clock(timerMs())}</b>${timer.startedAt ? '' : ' (en pause)'}</span>
+    <span>${timer.startedAt ? '<button data-act="timer-pause">Pause</button>' : '<button data-act="timer-resume">Reprendre</button>'}<button data-act="timer-finish">Terminer</button><button data-act="timer-discard" aria-label="Abandonner">✕</button></span>`;
+}
+function tickTimer() { const c = $('#tclock'); if (c && timer) c.textContent = clock(timerMs()); }
 
 class AuthError extends Error {}
 class RateError extends Error {}
@@ -692,13 +728,15 @@ function saveHw(id) {
 
 /* ----- Pratique du violon ----- */
 // Saisie d'une séance de violon : aujourd'hui, un jour précis (d) ou au choix (pick = sélecteur de date).
-function practiceDialog(d = today(), pick = false) {
+function practiceDialog(d = today(), pick = false, timerMin = null) {
   const cur = practiced(db, d) ? db.practice[d] : null;
+  const prefill = timerMin != null ? (cur && cur.minutes ? cur.minutes : 0) + timerMin : cur && cur.minutes ? cur.minutes : '';
   openDialog(`
     <h3>${pick ? 'Entraînement un autre jour' : d === today() ? 'Pratique du violon' : 'Pratique du violon : ' + esc(fmtShort(d))}</h3>
     ${pick ? `<label>Jour</label><input type="date" id="p-date" value="${d}" max="${today()}">` : ''}
-    <label>Minutes (facultatif)</label><input type="text" inputmode="numeric" id="p-min" placeholder="30" value="${cur && cur.minutes ? cur.minutes : ''}">
-    <div class="actions"><button class="btn" data-act="save-practice" data-date="${d}">Valider</button>
+    <label>Minutes (facultatif)</label><input type="text" inputmode="numeric" id="p-min" placeholder="30" value="${prefill}">
+    ${timerMin != null ? `<small>Minuteur : ${timerMin} min${cur && cur.minutes ? ` (ajoutées aux ${cur.minutes} min déjà enregistrées aujourd'hui)` : ''}</small>` : ''}
+    <div class="actions"><button class="btn" data-act="save-practice" data-date="${d}" ${timerMin != null ? 'data-timer="1"' : ''}>Valider</button>
       ${cur && !pick ? `<button class="btn sec" data-act="unpractice-day" data-date="${d}">Retirer ce jour</button>` : ''}
       <button class="btn sec" data-act="close">Fermer</button></div>`);
 }
@@ -879,6 +917,14 @@ const actions = {
     if (practiced(db, y)) { db.practice[y] = touch({ deleted: true }); save(); render(); } else practiceDialog(y);
   },
   stats: statsDialog,
+  'timer-start': () => { timer = { acc: 0, startedAt: Date.now() }; saveTimer(); render(); },
+  'timer-pause': () => { timer.acc = timerMs(); timer.startedAt = null; saveTimer(); },
+  'timer-resume': () => { timer.startedAt = Date.now(); saveTimer(); },
+  'timer-finish': () => {
+    timer.acc = timerMs(); timer.startedAt = null; saveTimer();
+    practiceDialog(today(), false, Math.max(1, Math.round(timer.acc / 60000)));
+  },
+  'timer-discard': () => { if (confirm('Abandonner ce minuteur sans enregistrer ?')) { timer = null; saveTimer(); render(); } },
   'practice-other': () => practiceDialog(addDays(today(), -1), true),
   'unpractice-day': b => { db.practice[b.dataset.date] = touch({ deleted: true }); save(); closeDialog(); render(); },
   'save-practice': b => {
@@ -887,6 +933,7 @@ const actions = {
     const day = pd ? pd.value : (b.dataset.date || today());
     if (!day || day > today()) { alert('Choisis un jour passé ou aujourd\'hui.'); return; }
     db.practice[day] = touch({ minutes: Number.isFinite(m) && m > 0 ? m : null });
+    if (b.dataset.timer) { timer = null; saveTimer(); }
     save(); closeDialog(); render();
   },
   unpractice: () => { db.practice[today()] = touch({ deleted: true }); save(); render(); },
@@ -1056,6 +1103,8 @@ refreshPushState();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); sync(); } });
 setInterval(() => { if (!document.hidden) sync(); }, 60000);
 setInterval(updateBanner, 30000);
+setInterval(tickTimer, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { tickTimer(); updateTimerBar(); } });
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
